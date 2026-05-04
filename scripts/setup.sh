@@ -59,7 +59,9 @@ esac
 
 echo "==> training stack"
 # transformers<5: fla uses the legacy _tied_weights_keys list contract.
-$PIP "transformers<5" datasets accelerate hydra-core wandb lm-eval einops
+# hf_transfer: Rust-based parallel HF Hub downloader (~10x). Honored when
+# HF_HUB_ENABLE_HF_TRANSFER=1 is set.
+$PIP "transformers<5" datasets accelerate hydra-core wandb lm-eval einops hf_transfer
 
 echo "==> mamba2 fast kernels"
 $PIP "${CAUSAL_CONV1D_WHL}" || \
