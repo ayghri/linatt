@@ -1,0 +1,19 @@
+micro_batch_size: 2
+gradient_accumulation_steps: 1
+max_steps: 50
+lr: 6.0e-4
+min_lr_rate: 0.1
+warmup_steps: 20      # 40% warmup so the curve is visible in W&B
+weight_decay: 0.1
+adam_beta1: 0.9
+adam_beta2: 0.95
+max_grad_norm: 1.0
+optim: adamw_torch_fused
+lr_scheduler_type: cosine_with_min_lr
+bf16: true
+gradient_checkpointing: false
+ddp_find_unused_parameters: false
+logging_steps: 1      # log every step in sanity
+save_total_limit: 1
+dataloader_num_workers: 2
+dataloader_pin_memory: true

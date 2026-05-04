@@ -1,0 +1,13 @@
+name: fineweb_edu_10bt
+dataset: HuggingFaceFW/fineweb-edu
+subset: sample-10BT
+split: train
+seq_len: 2048
+tokenizer: NousResearch/Llama-2-7b-hf   # ungated Llama-2 mirror; switch to meta-llama/Llama-2-7b-hf if HF auth set
+output_root: data
+# Resolved tokenized cache path
+cache_path: ${.output_root}/${.dataset}/${.subset}/${.split}
+# Preprocessing knobs
+num_proc: 128       # 200 vCPU H100 node — saturate tokenizer workers
+batch_size: 2048
+seed: ${seed}

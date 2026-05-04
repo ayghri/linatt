@@ -1,0 +1,26 @@
+name: delta_net_200m
+hf_kwargs:
+  model_type: delta_net
+  hidden_size: 768
+  num_hidden_layers: 24
+  num_heads: 12
+  expand_k: 1.0
+  expand_v: 1.0
+  use_gate: false
+  use_beta: true
+  use_short_conv: true
+  conv_size: 4
+  qk_norm: l2
+  qk_activation: silu
+  attn_mode: chunk
+  hidden_ratio: 4
+  hidden_act: swish
+  max_position_embeddings: 2048
+  norm_eps: 1.0e-6
+  tie_word_embeddings: true
+  fuse_norm: true
+  fuse_swiglu: true
+  fuse_cross_entropy: true
+  vocab_size: 32000
+  bos_token_id: 1
+  eos_token_id: 2

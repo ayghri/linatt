@@ -1,0 +1,38 @@
+# Top-level config. Compose model + data + train.
+# Override on cli, e.g.:
+#   python train.py model=mamba2_200m
+#   python train.py model=delta_net_200m train.lr=4e-4
+defaults:
+  - model: gated_deltanet_200m
+  - data: fineweb_edu_10bt
+  - train: default
+  - _self_
+
+run_name: ${model.name}_${data.name}
+output_dir: runs/${run_name}
+seed: 42
+
+wandb:
+  project: kata
+  entity: ayghri-cu
+  mode: online   # online | offline | disabled
+
+eval:
+  # Run lm-eval-harness inline at these fractions of total training steps.
+  fractions: [0.25, 0.50, 0.75, 1.00]
+  tasks:
+    - lambada_openai
+    - piqa
+    - hellaswag
+    - winogrande
+    - arc_easy
+    - arc_challenge
+    - social_iqa
+    - boolq
+  batch_size: 16
+
+hydra:
+  run:
+    dir: ${output_dir}/hydra
+  job:
+    chdir: false

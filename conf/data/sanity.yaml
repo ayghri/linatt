@@ -1,0 +1,11 @@
+name: sanity_wikitext
+dataset: wikitext
+subset: wikitext-2-raw-v1
+split: train
+seq_len: 512
+tokenizer: NousResearch/Llama-2-7b-hf
+output_root: data
+cache_path: ${.output_root}/${.dataset}/${.subset}/${.split}-${.seq_len}
+num_proc: 4
+batch_size: 256
+seed: ${seed}
