@@ -37,12 +37,27 @@ source .venv/bin/activate
 wandb login                             # paste API key
 ```
 
-`setup.sh` does NOT require mamba/conda on the node. It uses
-[`uv`](https://github.com/astral-sh/uv) (single static binary; auto-installs
-to `~/.local/bin` if missing) to create a python 3.11 venv at
-`LinAtt/.venv`, then installs torch 2.10.0+cu128, fla (editable),
-transformers <5, hydra, accelerate, wandb, lm-eval, plus prebuilt wheels for
-causal-conv1d 1.6.1 and mamba-ssm 2.3.1 (Mamba2 fast kernels).
+`setup.sh` does NOT require mamba/conda on the node and does NOT assume any
+particular surrounding repo layout. It uses [`uv`](https://github.com/astral-sh/uv)
+(single static binary; auto-installs to `~/.local/bin` if missing) to create
+a python 3.11 venv at `LinAtt/.venv`, then installs torch 2.10.0+cu128,
+**`flash-linear-attention==0.5.0` from PyPI**, transformers <5, hydra,
+accelerate, wandb, lm-eval, plus prebuilt wheels for causal-conv1d 1.6.1 and
+mamba-ssm 2.3.1 (Mamba2 fast kernels).
+
+To pin a different fla version or use a local editable copy:
+
+```bash
+# editable install from a local clone
+FLA_SOURCE=/path/to/flash-linear-attention bash scripts/setup.sh
+
+# git ref
+FLA_SOURCE='git+https://github.com/fla-org/flash-linear-attention.git@main' \
+    bash scripts/setup.sh
+
+# different PyPI version
+FLA_SOURCE='flash-linear-attention==0.6.0' bash scripts/setup.sh
+```
 
 If `meta-llama/Llama-2-7b-hf` is preferred over the ungated Nous mirror:
 
@@ -52,21 +67,10 @@ export HF_TOKEN=...
 bash scripts/prepare.sh data.tokenizer=meta-llama/Llama-2-7b-hf
 ```
 
-## 1. Pre-tokenize the corpus (one node, shared FS)
+## 1. Smoke test (run BEFORE the long prepare step)
 
-```bash
-bash scripts/prepare.sh                 # ~30–60 min on 200 vCPU
-```
-
-Caches packed ctx=2048 sequences to
-`data/HuggingFaceFW/fineweb-edu/sample-10BT/train`. Re-running is a no-op.
-**Run on the node whose filesystem the other nodes can read** (or replicate
-the cache). Each training node needs `data/...` in `LinAtt/`.
-
-## 2. Smoke test (run before any real training)
-
-Before kicking off a multi-hour run, validate that the full pipeline works
-end-to-end on this node. `sanity.sh` tokenizes wikitext-2, runs 50 train
+Validate that the full pipeline works end-to-end on this node. `sanity.sh`
+tokenizes wikitext-2 inline (~30 sec, no FineWeb dependency), runs 50 train
 steps + inline lm-eval, saves a checkpoint, and re-evals from the saved
 checkpoint. Default runs all 4 baselines sequentially.
 
@@ -81,8 +85,19 @@ Pass criteria:
 - four W&B runs visible at https://wandb.ai/${WANDB_ENTITY}/kata
 - `runs/sanity_<arch>/checkpoint-50/` directory exists for each arch
 
-If anything fails here, **do not launch real training** — fix the
-preflight/sanity error first.
+If anything fails here, **do not launch the prepare or training steps** —
+fix the error first. Sanity uses no production resources.
+
+## 2. Pre-tokenize the corpus (one node, shared FS)
+
+```bash
+bash scripts/prepare.sh                 # ~30–60 min on 200 vCPU
+```
+
+Caches packed ctx=2048 sequences to
+`data/HuggingFaceFW/fineweb-edu/sample-10BT/train`. Re-running is a no-op.
+**Run on the node whose filesystem the other nodes can read** (or replicate
+the cache). Each training node needs `data/...` in `LinAtt/`.
 
 ## 3. Train one arch per node, in parallel
 

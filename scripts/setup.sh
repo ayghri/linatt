@@ -20,8 +20,11 @@ MAMBA_SSM_WHL=${MAMBA_SSM_WHL:-https://github.com/state-spaces/mamba/releases/do
 # Resolve dirs.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LINATT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REPO_ROOT="$(cd "${LINATT_DIR}/.." && pwd)"
 VENV_DIR="${LINATT_DIR}/.venv"
+
+# fla source. Default = PyPI release. Override with FLA_SOURCE=/path/to/fla
+# (editable install) or FLA_SOURCE=git+https://github.com/fla-org/flash-linear-attention.git
+FLA_SOURCE=${FLA_SOURCE:-flash-linear-attention==0.5.0}
 
 # 1) Ensure uv is on PATH (install to ~/.local/bin if missing).
 if ! command -v uv >/dev/null 2>&1; then
@@ -41,8 +44,18 @@ PIP="uv pip install --python ${VENV_DIR}/bin/python"
 echo "==> torch ${TORCH_VERSION} + triton (CUDA 12.x)"
 $PIP "torch==${TORCH_VERSION}" triton --index-url "${TORCH_INDEX}"
 
-echo "==> fla (editable, from ${REPO_ROOT})"
-$PIP -e "${REPO_ROOT}"
+echo "==> fla (${FLA_SOURCE})"
+# - PyPI (default):  flash-linear-attention==0.5.1
+# - local editable: FLA_SOURCE=/path/to/fla        -> "-e /path/to/fla"
+# - git:            FLA_SOURCE=git+https://...
+case "${FLA_SOURCE}" in
+    /*|./*|../*)
+        $PIP -e "${FLA_SOURCE}"
+        ;;
+    *)
+        $PIP "${FLA_SOURCE}"
+        ;;
+esac
 
 echo "==> training stack"
 # transformers<5: fla uses the legacy _tied_weights_keys list contract.
