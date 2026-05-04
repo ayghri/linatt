@@ -229,8 +229,8 @@ LinAtt/
 | | value |
 |---|---|
 | optim | AdamW fused, β=(0.9,0.95), wd=0.1 |
-| lr | 6e-4 → 6e-5 (cosine_with_min_lr, min_lr_rate=0.1) |
-| warmup | 2000 steps |
+| lr | 4e-4 → 4e-5 (cosine_with_min_lr, min_lr_rate=0.1) |
+| warmup | 200 steps (≈1% of 19073, GatedDeltaNet paper convention) |
 | grad clip | 1.0 |
 | micro_batch | 32 / GPU |
 | ctx | 2048 |
@@ -240,10 +240,11 @@ LinAtt/
 
 > **Note**: `train.max_steps` in `conf/train/default.yaml` is sized for
 > 8×H100 (524k tok/step → 19073 steps for 10B tokens). On 4×H100 the
-> effective batch halves, so override:
+> effective batch halves, so scale both `max_steps` and `warmup_steps`
+> together to keep the 1% warmup ratio:
 > ```bash
 > NUM_GPUS=4 bash scripts/train.sh gated_deltanet_200m \
->     train.max_steps=38146 train.warmup_steps=4000
+>     train.max_steps=38146 train.warmup_steps=400
 > ```
 
 ## Eval suite

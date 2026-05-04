@@ -1,4 +1,4 @@
-# Training recipe shared across the three baselines.
+# Training recipe — matches GatedDeltaNet paper convention.
 # Effective batch on 8xH100: micro_bs * num_gpus * accum * seq_len
 #   = 32 * 8 * 1 * 2048 = 524288 tokens / step
 # 10B tokens / 524288 = 19073 steps
@@ -6,9 +6,12 @@ micro_batch_size: 32
 gradient_accumulation_steps: 1
 max_steps: 19073
 
-lr: 6.0e-4
+# GatedDeltaNet paper: peak lr=4e-4, min_lr=peak/10, warmup=1% of total tokens.
+# WARNING: keep warmup_steps ≈ 1% of max_steps when overriding either; if you
+# scale max_steps but forget warmup, you can end up with warmup > total steps.
+lr: 4.0e-4
 min_lr_rate: 0.1               # cosine_with_min_lr; final lr = lr * min_lr_rate
-warmup_steps: 2000
+warmup_steps: 200              # ≈ 1% of 19073 (paper convention)
 weight_decay: 0.1
 adam_beta1: 0.9
 adam_beta2: 0.95
