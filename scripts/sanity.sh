@@ -1,38 +1,63 @@
 #!/usr/bin/env bash
-# End-to-end sanity check on local node (e.g. 2x3090). ~4 min.
-# Tests: prepare -> train (50 steps) -> inline lm-eval on piqa -> standalone eval.
+# Smoke test the full pipeline before launching the real run.
+# Each arch: tokenize wikitext-2 -> 50 train steps -> inline lm-eval(piqa)
+# -> save checkpoint -> standalone eval(piqa) on the saved ckpt.
+#
+# Default: runs all 4 baselines sequentially (~5-15 min total on H100,
+# ~30 min on 2x3090).
+#
+# Usage:
+#   bash scripts/sanity.sh                       # all 4 archs
+#   bash scripts/sanity.sh transformer_200m      # one arch only
+#
+# Tunables:
+#   NUM_GPUS=4 bash scripts/sanity.sh            # default = nvidia-smi count, capped at 8
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MODEL=${1:-gated_deltanet_200m}
-NUM_GPUS=${NUM_GPUS:-2}
+ARCHS=("$@")
+if [ "${#ARCHS[@]}" -eq 0 ]; then
+    ARCHS=(transformer_200m gated_deltanet_200m delta_net_200m mamba2_200m)
+fi
 
-RUN=sanity_${MODEL}
-CKPT=runs/${RUN}
+if [ -z "${NUM_GPUS:-}" ]; then
+    NGPU=$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | head -1 || echo 1)
+    NUM_GPUS=$(( NGPU > 8 ? 8 : NGPU ))
+fi
+echo "==> Sanity sweep: ${#ARCHS[@]} arch(s) on ${NUM_GPUS} GPU(s)"
 
-echo "==> [1/3] Tokenize wikitext-2 (tiny)"
+# 1) Tokenize the tiny dev dataset once (cached by HF datasets).
+echo
+echo "==> [shared] Tokenize wikitext-2 (cached after first run)"
 python prepare.py data=sanity
 
-echo "==> [2/3] Train 50 steps on ${NUM_GPUS} GPUs"
-accelerate launch \
-    --num_processes "${NUM_GPUS}" \
-    --num_machines 1 \
-    --mixed_precision bf16 \
-    --main_process_port 29501 \
-    train.py \
-    model="${MODEL}" \
-    data=sanity \
-    train=sanity \
-    eval.fractions=[1.0] \
-    eval.tasks=[piqa] \
-    eval.batch_size=4 \
-    run_name="${RUN}" \
-    output_dir="${CKPT}"
+START=$(date +%s)
+for MODEL in "${ARCHS[@]}"; do
+    echo
+    echo "##############################"
+    echo "# Sanity: ${MODEL}"
+    echo "##############################"
+    RUN=sanity_${MODEL}
+    CKPT=runs/${RUN}
 
-echo "==> [3/3] Standalone eval on saved ckpt"
-CUDA_VISIBLE_DEVICES=0 python eval.py \
-    +ckpt="${CKPT}" \
-    eval.tasks=[piqa] \
-    eval.batch_size=4
+    echo "-- [1/2] Train 50 steps + inline piqa eval"
+    accelerate launch \
+        --num_processes "${NUM_GPUS}" --num_machines 1 \
+        --mixed_precision bf16 --main_process_port 29501 \
+        train.py \
+        model="${MODEL}" \
+        data=sanity train=sanity \
+        eval.fractions=[1.0] eval.tasks=[piqa] eval.batch_size=4 \
+        run_name="${RUN}" output_dir="${CKPT}"
 
-echo "==> Sanity passed."
+    echo "-- [2/2] Standalone piqa eval on saved ckpt"
+    CUDA_VISIBLE_DEVICES=0 python eval.py \
+        +ckpt="${CKPT}" \
+        eval.tasks=[piqa] eval.batch_size=4
+done
+
+DUR=$(( $(date +%s) - START ))
+echo
+echo "##############################"
+echo "# Sanity sweep PASSED for ${#ARCHS[@]} arch(s) in $((DUR / 60))m $((DUR % 60))s"
+echo "##############################"

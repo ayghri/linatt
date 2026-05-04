@@ -37,11 +37,15 @@ class LMEvalCallback(TrainerCallback):
             return
         self._fired.add(step)
 
+        # Tell HF Trainer to save the checkpoint right after this step.
+        # Trainer writes to {output_dir}/checkpoint-{step}/ via its own logic
+        # (handles DDP correctly, respects save_total_limit, atomic).
+        control.should_save = True
+
         model = kwargs.get('model')
         if model is None:
             return
-        # Unwrap DDP / accelerate
-        bare = getattr(model, 'module', model)
+        bare = getattr(model, 'module', model)  # unwrap DDP
 
         is_main = state.is_world_process_zero
         if dist.is_available() and dist.is_initialized():
@@ -55,6 +59,8 @@ class LMEvalCallback(TrainerCallback):
 
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
+
+        return control
 
     def _run(self, model, state, args):
         import lm_eval

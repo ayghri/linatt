@@ -81,8 +81,8 @@ def main(cfg: DictConfig) -> None:
         lr_sched_kwargs = {'min_lr_rate': cfg.train.min_lr_rate}
 
     # ---- Eval steps ----
+    # Callback fires lm-eval AND triggers a checkpoint save at each of these.
     eval_steps = [int(cfg.train.max_steps * f) for f in cfg.eval.fractions]
-    save_steps = max(1, eval_steps[0])  # also save at the same cadence
 
     args = TrainingArguments(
         output_dir=cfg.output_dir,
@@ -104,7 +104,7 @@ def main(cfg: DictConfig) -> None:
         gradient_checkpointing=cfg.train.gradient_checkpointing,
         ddp_find_unused_parameters=cfg.train.ddp_find_unused_parameters,
         logging_steps=cfg.train.logging_steps,
-        save_steps=save_steps,
+        save_strategy='no',  # callback drives saves at eval steps
         save_total_limit=cfg.train.save_total_limit,
         dataloader_num_workers=cfg.train.dataloader_num_workers,
         dataloader_pin_memory=cfg.train.dataloader_pin_memory,

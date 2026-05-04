@@ -133,11 +133,11 @@ fi
 
 # 7. All three model configs build (cheap)
 echo "-- model configs build"
-python - <<'PY' 2>/dev/null
-import yaml, torch, fla
+PYTHONPATH=. python - <<'PY' 2>/dev/null
+import yaml, torch, fla, fla_patches
 from transformers import AutoConfig, AutoModelForCausalLM
 sizes = {}
-for f in ('gated_deltanet_200m', 'delta_net_200m', 'mamba2_200m'):
+for f in ('gated_deltanet_200m', 'delta_net_200m', 'mamba2_200m', 'transformer_200m'):
     y = yaml.safe_load(open(f'conf/model/{f}.yaml'))
     cfg = AutoConfig.for_model(**y['hf_kwargs'])
     m = AutoModelForCausalLM.from_config(cfg, dtype=torch.bfloat16)
@@ -145,7 +145,7 @@ for f in ('gated_deltanet_200m', 'delta_net_200m', 'mamba2_200m'):
 print('  ' + ' | '.join(f'{k}={v:.0f}M' for k, v in sizes.items()))
 PY
 if [ $? -eq 0 ]; then
-    pass "all three baselines build"
+    pass "all baselines build"
 else
     fail "one or more model configs failed to build"
 fi

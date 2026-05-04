@@ -21,7 +21,7 @@ eval:
   # Run lm-eval-harness inline at these fractions of total training steps.
   fractions: [0.25, 0.50, 0.75, 1.00]
   tasks:
-    - lambada_openai
+    # acc tasks
     - piqa
     - hellaswag
     - winogrande
@@ -29,6 +29,10 @@ eval:
     - arc_challenge
     - social_iqa
     - boolq
+    # acc + perplexity
+    - lambada_openai
+    # word_perplexity / byte_perplexity / bits_per_byte
+    - wikitext
   batch_size: 16
 
 hydra:
