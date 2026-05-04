@@ -30,6 +30,7 @@ accelerate launch \
     --num_processes "${NUM_GPUS}" \
     --num_machines 1 \
     --mixed_precision bf16 \
+    --dynamo_backend no \
     --main_process_port "${MASTER_PORT}" \
     train.py \
     model="${MODEL}" \

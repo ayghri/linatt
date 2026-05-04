@@ -42,8 +42,17 @@ def collate(features, pad_id):
 
 @hydra.main(version_base=None, config_path='conf', config_name='config')
 def main(cfg: DictConfig) -> None:
-    logging.basicConfig(level=logging.INFO)
-    logger.info(f'\n{OmegaConf.to_yaml(cfg)}')
+    # Rank-aware logging: only the main process prints INFO; others stay at WARNING.
+    # accelerate launch sets LOCAL_RANK and RANK env vars; on a single-machine
+    # setup they coincide. Falls back to 0 if running without distributed launcher.
+    rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', 0)))
+    is_main = (rank == 0)
+    logging.basicConfig(
+        level=logging.INFO if is_main else logging.WARNING,
+        force=True,
+    )
+    if is_main:
+        logger.info(f'\n{OmegaConf.to_yaml(cfg)}')
 
     # ---- W&B setup (HF Trainer reads these env vars) ----
     os.environ['WANDB_PROJECT'] = cfg.wandb.project
@@ -63,8 +72,9 @@ def main(cfg: DictConfig) -> None:
     hf_kwargs = OmegaConf.to_container(cfg.model.hf_kwargs, resolve=True)
     hf_cfg = AutoConfig.for_model(**hf_kwargs)
     model = AutoModelForCausalLM.from_config(hf_cfg, dtype=torch.bfloat16)
-    n_train, n_all = model.num_parameters(only_trainable=True), model.num_parameters()
-    logger.info(f'Params: trainable={n_train:,} / total={n_all:,} ({n_train / n_all:.2%})')
+    if is_main:
+        n_train, n_all = model.num_parameters(only_trainable=True), model.num_parameters()
+        logger.info(f'Params: trainable={n_train:,} / total={n_all:,} ({n_train / n_all:.2%})')
 
     # ---- Dataset (must be pre-tokenized via prepare.py) ----
     if not os.path.exists(cfg.data.cache_path):
@@ -73,7 +83,8 @@ def main(cfg: DictConfig) -> None:
             f'Run: python prepare.py'
         )
     dataset = load_from_disk(cfg.data.cache_path).shuffle(seed=cfg.seed)
-    logger.info(f'Dataset: {dataset}')
+    if is_main:
+        logger.info(f'Dataset: {dataset}')
 
     # ---- LR scheduler kwargs ----
     lr_sched_kwargs = {}
