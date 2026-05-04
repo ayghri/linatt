@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Smoke test the full pipeline before launching the real run.
-# Each arch: tokenize wikitext-2 -> 50 train steps -> inline lm-eval(piqa)
-# -> save checkpoint -> standalone eval(piqa) on the saved ckpt.
+# Each arch: tokenize wikitext-2 -> 50 train steps -> inline lm-eval (FULL
+# task list from conf/config.yaml) -> save checkpoint -> standalone eval
+# (FULL list) on the saved ckpt. Every eval task is exercised end-to-end so
+# dataset/loader breakage surfaces here, not in the production run.
 #
 # Default: runs all 4 baselines sequentially (~5-15 min total on H100,
 # ~30 min on 2x3090).
@@ -40,20 +42,22 @@ for MODEL in "${ARCHS[@]}"; do
     RUN=sanity_${MODEL}
     CKPT=runs/${RUN}
 
-    echo "-- [1/2] Train 50 steps + inline piqa eval"
+    echo "-- [1/2] Train 50 steps + inline FULL eval suite"
+    # Uses default eval.tasks list from conf/config.yaml (all 8 tasks).
+    # eval.fractions=[1.0] -> only the final eval (saves time vs 4 evals).
+    # eval.batch_size=4 to fit on small dev GPUs.
     accelerate launch \
         --num_processes "${NUM_GPUS}" --num_machines 1 \
         --mixed_precision bf16 --main_process_port 29501 \
         train.py \
         model="${MODEL}" \
         data=sanity train=sanity \
-        eval.fractions=[1.0] eval.tasks=[piqa] eval.batch_size=4 \
+        eval.fractions=[1.0] eval.batch_size=4 \
         run_name="${RUN}" output_dir="${CKPT}"
 
-    echo "-- [2/2] Standalone piqa eval on saved ckpt"
+    echo "-- [2/2] Standalone FULL eval suite on saved ckpt"
     CUDA_VISIBLE_DEVICES=0 python eval.py \
-        +ckpt="${CKPT}" \
-        eval.tasks=[piqa] eval.batch_size=4
+        +ckpt="${CKPT}" eval.batch_size=4
 done
 
 DUR=$(( $(date +%s) - START ))

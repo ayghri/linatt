@@ -8,6 +8,6 @@ output_root: data
 # Resolved tokenized cache path
 cache_path: ${.output_root}/${.dataset}/${.subset}/${.split}
 # Preprocessing knobs
-num_proc: 128       # 200 vCPU H100 node — saturate tokenizer workers
+num_proc: 16
 batch_size: 2048
 seed: ${seed}

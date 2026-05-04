@@ -14,7 +14,9 @@ Notes:
 from __future__ import annotations
 
 import gc
+import json
 import logging
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -75,36 +77,76 @@ class LMEvalCallback(TrainerCallback):
         lm = HFLM(pretrained=model, tokenizer=self.tokenizer,
                   batch_size=self.batch_size, device=str(device))
 
-        with torch.inference_mode():
-            results = lm_eval.simple_evaluate(
-                model=lm,
-                tasks=self.tasks,
-                batch_size=self.batch_size,
-                device=str(device),
-            )
+        # Run each task in isolation so one failing task (e.g. dataset script
+        # loader removed in datasets>=4) doesn't take down the rest. Each task
+        # is logged to W&B as soon as it succeeds, so a crash mid-suite still
+        # leaves partial scores recorded.
+        all_metrics = {}
+        for task in self.tasks:
+            try:
+                with torch.inference_mode():
+                    res = lm_eval.simple_evaluate(
+                        model=lm,
+                        tasks=[task],
+                        batch_size=self.batch_size,
+                        device=str(device),
+                    )
+                task_metrics = res['results'].get(task, {})
+                all_metrics[task] = task_metrics
+                self._log_task_to_wandb(task, task_metrics, state.global_step)
+                # Print headline metric so progress is visible in the trainer log too.
+                headline = (task_metrics.get('acc,none')
+                            or task_metrics.get('perplexity,none')
+                            or task_metrics.get('word_perplexity,none')
+                            or 'done')
+                logger.info(f'[step {state.global_step}] {task} -> {headline} (logged to W&B)')
+            except Exception as e:
+                logger.warning(f'[step {state.global_step}] task {task!r} failed: {e}')
 
-        # Log to W&B (HF Trainer initialised wandb already if report_to=wandb)
-        try:
-            import wandb
-            if wandb.run is not None:
-                flat = {}
-                for task, metrics in results['results'].items():
-                    for k, v in metrics.items():
-                        if isinstance(v, (int, float)):
-                            flat[f'eval/{task}/{k}'] = v
-                flat['train/global_step'] = state.global_step
-                wandb.log(flat, step=state.global_step)
-        except ImportError:
-            pass
-
-        # Print a concise summary line
         summary = ' | '.join(
             f"{t}={(m.get('acc,none') or m.get('acc') or m.get('perplexity,none') or m.get('perplexity') or 'n/a')}"
-            for t, m in results['results'].items()
+            for t, m in all_metrics.items()
         )
         logger.info(f'[step {state.global_step}] {summary}')
+
+        # Persist alongside the run so you can read scores without W&B.
+        # Trainer hasn't saved the checkpoint dir yet (will after this hook
+        # returns due to control.should_save=True), so we write to the
+        # parent output_dir under an `eval/` subfolder.
+        try:
+            eval_dir = Path(args.output_dir) / 'eval'
+            eval_dir.mkdir(parents=True, exist_ok=True)
+            out = eval_dir / f'step-{state.global_step}.json'
+            with out.open('w') as f:
+                json.dump({
+                    'global_step': state.global_step,
+                    'tasks': all_metrics,
+                }, f, indent=2, default=str)
+            logger.info(f'[step {state.global_step}] wrote {out}')
+        except Exception as e:
+            logger.warning(f'[step {state.global_step}] eval json dump failed: {e}')
 
         if was_training:
             model.train()
         torch.cuda.empty_cache()
         gc.collect()
+
+    @staticmethod
+    def _log_task_to_wandb(task, metrics, step):
+        """Push one task's metrics to W&B and flush.
+
+        Each call uses the same `step=`, which W&B merges into the same
+        x-axis point. Different tasks land in different keys
+        (`eval/<task>/...`), so no collision. `commit=True` (default) flushes
+        immediately so the next task's eval doesn't have to finish first.
+        """
+        try:
+            import wandb
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+        flat = {f'eval/{task}/{k}': v for k, v in metrics.items()
+                if isinstance(v, (int, float))}
+        if flat:
+            wandb.log(flat, step=step, commit=True)

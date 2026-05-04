@@ -63,6 +63,36 @@ else
     echo "  [warn] causal-conv1d / mamba-ssm missing; Mamba2 will run on Triton fallback (slower but correct)"
 fi
 
+# 2c. tilelang (required on Hopper for gated_deltanet bwd correctness)
+echo "-- tilelang (Hopper bwd correctness)"
+TL_OK=$(python -c "
+try:
+    import tilelang
+    print(1)
+except ImportError:
+    print(0)
+" 2>/dev/null)
+GPU_NAME=$(python -c "
+try:
+    import torch
+    print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')
+except Exception:
+    print('')
+" 2>/dev/null)
+if [[ "$GPU_NAME" == *H100* || "$GPU_NAME" == *H200* || "$GPU_NAME" == *Hopper* ]]; then
+    if [ "$TL_OK" = "1" ]; then
+        pass "tilelang available (Hopper detected)"
+    else
+        fail "tilelang missing AND running on Hopper - gated chunk bwd will produce incorrect grads (fla #640). Install: pip install tilelang"
+    fi
+else
+    if [ "$TL_OK" = "1" ]; then
+        pass "tilelang available"
+    else
+        echo "  [info] tilelang not installed; not required on this GPU"
+    fi
+fi
+
 # 3. GPUs
 N_GPU=$(python -c "import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 0)" 2>/dev/null)
 if [ "${N_GPU:-0}" -ge 1 ]; then

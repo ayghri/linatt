@@ -1,7 +1,7 @@
 # LinAtt — 200M-class linear-attention LLM benchmark
 
 Trains three FLA-family baselines from scratch on 10B FineWeb-Edu tokens and
-evaluates them on 9 lm-eval-harness tasks (7 multiple-choice acc + 2 perplexity:
+evaluates them on 8 lm-eval-harness tasks (6 multiple-choice acc + 2 perplexity:
 LAMBADA + Wikitext). Drop in your own architecture as a 4th yaml under
 `conf/model/` and rerun.
 
@@ -258,7 +258,6 @@ checkpoint and logs to W&B:
 | winogrande      | acc                                             |
 | arc_easy        | acc                                             |
 | arc_challenge   | acc                                             |
-| social_iqa      | acc                                             |
 | boolq           | acc                                             |
 | lambada_openai  | acc + perplexity                                |
 | wikitext        | word_perplexity, byte_perplexity, bits_per_byte |
