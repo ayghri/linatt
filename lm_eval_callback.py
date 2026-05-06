@@ -77,10 +77,15 @@ class LMEvalCallback(TrainerCallback):
         lm = HFLM(pretrained=model, tokenizer=self.tokenizer,
                   batch_size=self.batch_size, device=str(device))
 
-        # Run each task in isolation so one failing task (e.g. dataset script
-        # loader removed in datasets>=4) doesn't take down the rest. Each task
-        # is logged to W&B as soon as it succeeds, so a crash mid-suite still
-        # leaves partial scores recorded.
+        # Per-task isolation: one failing task (e.g. dataset loader removed in
+        # datasets>=4) doesn't take down the rest. File: rewritten after every
+        # task so a mid-suite crash still leaves the completed scores on disk.
+        # W&B: batched once at the end so all tasks land at the same train
+        # step without hitting wandb's "can't log same step twice" rule.
+        eval_dir = Path(args.output_dir) / 'eval'
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        out_path = eval_dir / f'step-{state.global_step}.json'
+
         all_metrics = {}
         for task in self.tasks:
             try:
@@ -93,52 +98,56 @@ class LMEvalCallback(TrainerCallback):
                     )
                 task_metrics = res['results'].get(task, {})
                 all_metrics[task] = task_metrics
-                self._log_task_to_wandb(task, task_metrics, state.global_step)
-                # Print headline metric so progress is visible in the trainer log too.
+                # Persist immediately — every successful task is on disk
+                # before the next one starts.
+                with out_path.open('w') as f:
+                    json.dump({'global_step': state.global_step,
+                               'tasks': all_metrics}, f, indent=2, default=str)
                 headline = (task_metrics.get('acc,none')
                             or task_metrics.get('perplexity,none')
                             or task_metrics.get('word_perplexity,none')
                             or 'done')
-                logger.info(f'[step {state.global_step}] {task} -> {headline} (logged to W&B)')
+                logger.info(f'[step {state.global_step}] {task} -> {headline} '
+                            f'(saved to {out_path.name})')
             except Exception as e:
                 logger.warning(f'[step {state.global_step}] task {task!r} failed: {e}')
 
-        summary = ' | '.join(
-            f"{t}={(m.get('acc,none') or m.get('acc') or m.get('perplexity,none') or m.get('perplexity') or 'n/a')}"
-            for t, m in all_metrics.items()
-        )
-        logger.info(f'[step {state.global_step}] {summary}')
+        # Single batched W&B log at the end of the eval cycle.
+        self._log_all_to_wandb(all_metrics, state.global_step)
+        logger.info(f'[step {state.global_step}] {len(all_metrics)} task(s) logged to W&B')
 
-        # Persist alongside the run so you can read scores without W&B.
-        # Trainer hasn't saved the checkpoint dir yet (will after this hook
-        # returns due to control.should_save=True), so we write to the
-        # parent output_dir under an `eval/` subfolder.
+        # Aggressive teardown of HFLM + lm-eval refs. Without this, KV-cache
+        # tensors allocated during loglikelihood scoring linger in PyTorch's
+        # caching allocator at non-training shapes, fragmenting the pool and
+        # slowing training step times for hundreds of steps after.
+        del lm
         try:
-            eval_dir = Path(args.output_dir) / 'eval'
-            eval_dir.mkdir(parents=True, exist_ok=True)
-            out = eval_dir / f'step-{state.global_step}.json'
-            with out.open('w') as f:
-                json.dump({
-                    'global_step': state.global_step,
-                    'tasks': all_metrics,
-                }, f, indent=2, default=str)
-            logger.info(f'[step {state.global_step}] wrote {out}')
-        except Exception as e:
-            logger.warning(f'[step {state.global_step}] eval json dump failed: {e}')
+            del res
+        except UnboundLocalError:
+            pass
 
         if was_training:
             model.train()
-        torch.cuda.empty_cache()
         gc.collect()
+        torch.cuda.empty_cache()
+        # Force the caching allocator to release segments back to the driver.
+        # This is more aggressive than empty_cache alone and clears the
+        # fragmentation eval introduced. Costs nothing other than the next
+        # allocation having to go through cudaMalloc once.
+        try:
+            torch.cuda.synchronize()
+            if hasattr(torch.cuda, 'reset_peak_memory_stats'):
+                torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
 
     @staticmethod
-    def _log_task_to_wandb(task, metrics, step):
-        """Push one task's metrics to W&B and flush.
+    def _log_all_to_wandb(all_metrics, step):
+        """Single batched W&B log for the whole eval cycle.
 
-        Each call uses the same `step=`, which W&B merges into the same
-        x-axis point. Different tasks land in different keys
-        (`eval/<task>/...`), so no collision. `commit=True` (default) flushes
-        immediately so the next task's eval doesn't have to finish first.
+        Done once at the end so multiple tasks land at the same train step
+        without hitting wandb's "can't go backward" rule (which silently drops
+        repeated `wandb.log(..., step=N, commit=True)` calls at the same N).
         """
         try:
             import wandb
@@ -146,7 +155,10 @@ class LMEvalCallback(TrainerCallback):
             return
         if wandb.run is None:
             return
-        flat = {f'eval/{task}/{k}': v for k, v in metrics.items()
-                if isinstance(v, (int, float))}
+        flat = {}
+        for task, metrics in all_metrics.items():
+            for k, v in metrics.items():
+                if isinstance(v, (int, float)):
+                    flat[f'eval/{task}/{k}'] = v
         if flat:
             wandb.log(flat, step=step, commit=True)
