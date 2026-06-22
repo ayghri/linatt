@@ -1,0 +1,36 @@
+name: kata_spd_200m
+# Matches gated_deltanet_200m architectural shapes:
+#   hidden=768, num_heads=12, head_dim=64, expand_v=1.0
+# So the only difference from GDN is the attention block (KATA SPD instead of
+# gated delta rule). Per-head config:
+#   head_k_dim = 64, head_v_dim = 64
+#   spd_num_groups M = 4 -> E_per_group = 16 (= triton tl.dot min)
+#   q_total per head = M * E^2 = 4 * 256 = 1024 (vs GDN's 64)
+#   state per head per chunk boundary = q_total * head_v_dim = 1024 * 64 = 64K floats
+hf_kwargs:
+  model_type: kata
+  hidden_size: 768
+  num_hidden_layers: 24
+  num_heads: 12
+  expand_k: 1.0
+  expand_v: 1.0
+  feature_map: spd_concat
+  spd_num_groups: 4
+  spd_use_kernel: true
+  spd_chunk_size: 32     # NC = 2048 / 32 = 64, power of 2. Run sweep on H100 to confirm.
+  # DV block / num_warps / num_stages: triton.autotune picks per shape on first call
+  feature_map_eps: 1.0e-6
+  norm_q: false
+  norm_k: false
+  attn_mode: chunk
+  hidden_ratio: 4
+  hidden_act: swish
+  max_position_embeddings: 2048
+  norm_eps: 1.0e-6
+  tie_word_embeddings: true
+  fuse_norm: true
+  fuse_swiglu: true
+  fuse_cross_entropy: true
+  vocab_size: 32000
+  bos_token_id: 1
+  eos_token_id: 2

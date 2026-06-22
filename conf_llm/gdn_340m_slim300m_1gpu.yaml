@@ -1,0 +1,52 @@
+# 340M GatedDeltaNet on 300M real SlimPajama tokens, single 3090.
+# fp32 master + bf16 residual recipe (run_llm.py applies the embedding-output cast).
+# tokens_per_step = bs4 * world1 * accum8 * seq2048 = 65,536
+# 300M / 65536 ~= 4577 steps. (single GPU -> world_size=1)
+
+model:
+  hf_kwargs:
+    model_type: gated_deltanet
+    hidden_size: 1024
+    num_hidden_layers: 24
+    num_heads: 16
+    head_dim: 64
+    expand_v: 1.0
+    use_gate: true
+    use_short_conv: true
+    conv_size: 4
+    attn_mode: chunk
+    hidden_ratio: 4
+    hidden_act: swish
+    max_position_embeddings: 2048
+    norm_eps: 1.0e-6
+    tie_word_embeddings: true
+    fuse_norm: true
+    fuse_swiglu: true
+    fuse_cross_entropy: false
+    fuse_linear_cross_entropy: true
+    vocab_size: 32000
+    bos_token_id: 1
+    eos_token_id: 2
+
+data:
+  cache_path: data/slimpajama_627b/300m/train
+
+train:
+  backend: nccl
+  batch_size: 4            # micro-batch per GPU (3090 24GB, seq 2048)
+  seq_len: 2048
+  grad_accum: 8           # effective batch = 4*1*8*2048 = 65,536 tok/step
+  total_tokens: 300_000_000
+  progress_interval: 20
+  save_interval: 1000
+  save_dir: runs/gdn_340m_slim300m
+
+  optimizer:
+    lr: 3.0e-4
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+  schedule:
+    warmup_steps: 46      # ~1% of ~4577 steps
+    peak_lr: 3.0e-4
+    min_lr: 3.0e-5

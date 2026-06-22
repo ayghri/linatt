@@ -2,30 +2,31 @@
 # Effective batch on 8xH100: micro_bs * num_gpus * accum * seq_len
 #   = 32 * 8 * 1 * 2048 = 524288 tokens / step
 # 10B tokens / 524288 = 19073 steps
-micro_batch_size: 32
-gradient_accumulation_steps: 1
-max_steps: 19073
+gradient_accum: 1
+tokens_per_step: 524_288
+warmup_tokens: 500_000_000
 
 # GatedDeltaNet paper: peak lr=4e-4, min_lr=peak/10, warmup=1% of total tokens.
 # WARNING: keep warmup_steps ≈ 1% of max_steps when overriding either; if you
 # scale max_steps but forget warmup, you can end up with warmup > total steps.
-lr: 4.0e-4
-min_lr_rate: 0.1               # cosine_with_min_lr; final lr = lr * min_lr_rate
-warmup_steps: 200              # ≈ 1% of 19073 (paper convention)
-weight_decay: 0.1
-adam_beta1: 0.9
-adam_beta2: 0.95
+lr: 3.0e-4
+min_lr_rate: 0.1 # cosine_with_min_lr; final lr = lr * min_lr_rate
+warmup_steps: 200 # ≈ 1% of 19073 (paper convention)
+weight_decay: 0.01
+adam_betas: (0.9, 0.95)
 max_grad_norm: 1.0
 optim: adamw_torch_fused
 lr_scheduler_type: cosine_with_min_lr
 
-bf16: true                     # bf16 weights + activations
-gradient_checkpointing: false  # 200M fits without
+# 340M is larger than the 200M baseline; trim peak LR slightly from 4e-4.
+
+bf16: true # bf16 weights + activations
+gradient_checkpointing: false # 200M fits without
 ddp_find_unused_parameters: false
 
 logging_steps: 50
 save_total_limit: 4
 
-dataloader_num_workers: 16    # 200 vCPU node; 2 workers/GPU
+dataloader_num_workers: 16 # 200 vCPU node; 2 workers/GPU
 dataloader_pin_memory: true
 dataloader_persistent_workers: true

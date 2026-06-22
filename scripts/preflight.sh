@@ -167,7 +167,7 @@ PYTHONPATH=. python - <<'PY' 2>/dev/null
 import yaml, torch, fla, fla_patches
 from transformers import AutoConfig, AutoModelForCausalLM
 sizes = {}
-for f in ('gated_deltanet_200m', 'delta_net_200m', 'mamba2_200m', 'transformer_200m'):
+for f in ('gated_deltanet_200m', 'delta_net_200m', 'mamba2_200m', 'transformer_200m', 'kata_200m', 'kata_spd_200m'):
     y = yaml.safe_load(open(f'conf/model/{f}.yaml'))
     cfg = AutoConfig.for_model(**y['hf_kwargs'])
     m = AutoModelForCausalLM.from_config(cfg, dtype=torch.bfloat16)

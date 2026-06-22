@@ -3,23 +3,24 @@
 #   python train.py model=mamba2_200m
 #   python train.py model=delta_net_200m train.lr=4e-4
 defaults:
-  - model: gated_deltanet_200m
-  - data: fineweb_edu_10bt
+  - model: gated_deltanet_340m
+  - data: slimpajama_15bt
   - train: default
   - _self_
 
 run_name: ${model.name}_${data.name}
 output_dir: runs/${run_name}
+checkpoint_rate: 0.05
 seed: 42
 
 wandb:
   project: kata
   entity: ayghri-cu
-  mode: online   # online | offline | disabled
+  mode: online # online | offline | disabled
 
 eval:
   # Run lm-eval-harness inline at these fractions of total training steps.
-  fractions: [0.25, 0.50, 0.75, 1.00]
+  fractions: [0.20, 0.40, 0.60, 0.80, 1.00]
   tasks:
     # acc tasks
     - piqa

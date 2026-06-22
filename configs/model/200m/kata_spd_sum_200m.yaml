@@ -1,0 +1,42 @@
+name: kata_spd_sum_200m
+# 200M KATA-SPD-sum-packed. Matches gated_deltanet_200m architectural shapes
+# (hidden=768, num_heads=12, head_dim=64, expand_v=1.0) and the GDN-style
+# attention block scaffold: ShortConvolution(silu) on q/k/v + final RMSNorm.
+# Differences from GDN: no gates, no delta rule. The recurrence is plain
+# linear-attention with normalization on the packed-SPD feature map.
+#
+# Feature map = ε*I + (1/M) Σ_i g_i g_i^T  packed lower-triangle
+# (same math as `psi_packed(variant="four_rank")` in kata/reference.py and
+# `LinAtt/kata/feature_maps.py::spd_sum_packed`).
+#   head_k_dim = 64, M=4 -> E=16 -> qd = 16*17/2 = 136
+#   state per head per chunk boundary = qd * head_v_dim = 136 * 64 = 8.7K floats
+# At T=2048 chunked into C=64 (NC=32), this fits H100 SRAM comfortably and
+# routes through FLA chunk_linear_attn(normalize=True).
+hf_kwargs:
+  model_type: kata
+  hidden_size: 768
+  num_hidden_layers: 24
+  num_heads: 12
+  expand_k: 1.0
+  expand_v: 1.0
+  feature_map: spd_sum_packed
+  spd_num_groups: 4
+  spd_use_kernel: false       # FLA path; spd_use_kernel only valid for spd_concat
+  feature_map_eps: 1.0e-4
+  norm_q: false
+  norm_k: false
+  use_short_conv: true
+  conv_size: 4
+  conv_bias: false
+  attn_mode: chunk
+  hidden_ratio: 4
+  hidden_act: swish
+  max_position_embeddings: 2048
+  norm_eps: 1.0e-6
+  tie_word_embeddings: true
+  fuse_norm: true
+  fuse_swiglu: true
+  fuse_cross_entropy: true
+  vocab_size: 32000
+  bos_token_id: 1
+  eos_token_id: 2

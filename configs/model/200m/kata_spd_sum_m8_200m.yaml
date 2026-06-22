@@ -1,0 +1,35 @@
+name: kata_spd_sum_m8_200m
+# 200M KATA-SPD-sum-packed with M=8 (instead of M=4).
+# At d_head=64, M=8 -> E=8 -> qd = 8*9/2 = 36 (vs 136 at M=4).
+# Smaller post-psi qd should match positive (qd=64) throughput, ~217 ktok/s
+# fwd+bwd on H100 vs 43 ktok/s at M=4.
+# Trade-off: smaller per-group state -> lower per-group capacity, but
+# 8 groups instead of 4 still keeps the same total qd*dv state budget.
+hf_kwargs:
+  model_type: kata
+  hidden_size: 768
+  num_hidden_layers: 24
+  num_heads: 12
+  expand_k: 1.0
+  expand_v: 1.0
+  feature_map: spd_sum_packed
+  spd_num_groups: 8
+  spd_use_kernel: false
+  feature_map_eps: 1.0e-4
+  norm_q: false
+  norm_k: false
+  use_short_conv: true
+  conv_size: 4
+  conv_bias: false
+  attn_mode: chunk
+  hidden_ratio: 4
+  hidden_act: swish
+  max_position_embeddings: 2048
+  norm_eps: 1.0e-6
+  tie_word_embeddings: true
+  fuse_norm: true
+  fuse_swiglu: true
+  fuse_cross_entropy: true
+  vocab_size: 32000
+  bos_token_id: 1
+  eos_token_id: 2

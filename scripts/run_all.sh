@@ -9,7 +9,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ARCHS=${ARCHS:-"gated_deltanet_200m delta_net_200m mamba2_200m transformer_200m"}
+ARCHS=${ARCHS:-"gated_deltanet_200m delta_net_200m mamba2_200m transformer_200m kata_200m"}
 NUM_GPUS=${NUM_GPUS:-8}
 
 # Run preflight once up front so we fail fast.

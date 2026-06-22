@@ -29,8 +29,14 @@ def apply() -> None:
         Mamba2ForCausalLM._tied_weights_keys = ['lm_head.weight']
 
     _patch_fla_attn_to_sdpa_flash()
+    _register_kata()
 
     _APPLIED = True
+
+
+def _register_kata() -> None:
+    """Register the KATA model with HF Auto* (importing the package does it)."""
+    import kata  # noqa: F401
 
 
 def _patch_fla_attn_to_sdpa_flash() -> None:

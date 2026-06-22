@@ -1,0 +1,26 @@
+# 340M @ 15B SlimPajama tokens. Effective batch matches the validated 200M
+# recipe: 524,288 tokens/optimizer-step.
+#   4xH100 x micro 32 x grad_accum 4 x 2048 = 524,288   (or 8 GPU x accum 2, etc.)
+# 15B / 524288 = 28,610 steps.
+# micro_batch_size: 32
+tokens_per_step: 524_288
+warmup_tokens: 500_000_000
+# 340M is larger than the 200M baseline; trim peak LR slightly from 4e-4.
+optim: adamw_torch_fused
+lr: 3.0e-4
+weight_decay: 0.01
+adam_betas: (0.9, 0.95)
+max_grad_norm: 1.0
+lr_scheduler_type: cosine_with_min_lr
+min_lr_rate: 3.0e-5                 # cosine floor = 3e-5
+
+bf16: true
+gradient_checkpointing: false    # set true if 340M @ micro 32 OOMs on 80GB
+ddp_find_unused_parameters: false
+
+logging_steps: 50
+save_total_limit: 4
+
+dataloader_num_workers: 8
+dataloader_pin_memory: true
+dataloader_persistent_workers: true

@@ -1,0 +1,49 @@
+# A/B: fp32 MASTER (fixed recipe). peak_lr 8e-5 puts the whole run in the
+# low-LR regime where bf16 master freezes params -> divergence should be clear.
+# tokens_per_step = 4*1*8*2048 = 65536 ; 20M / 65536 ~= 305 steps.
+model:
+  hf_kwargs:
+    model_type: gated_deltanet
+    hidden_size: 1024
+    num_hidden_layers: 24
+    num_heads: 16
+    head_dim: 64
+    expand_v: 1.0
+    use_gate: true
+    use_short_conv: true
+    conv_size: 4
+    attn_mode: chunk
+    hidden_ratio: 4
+    hidden_act: swish
+    max_position_embeddings: 2048
+    norm_eps: 1.0e-6
+    tie_word_embeddings: true
+    fuse_norm: true
+    fuse_swiglu: true
+    fuse_cross_entropy: false
+    fuse_linear_cross_entropy: true
+    vocab_size: 32000
+    bos_token_id: 1
+    eos_token_id: 2
+
+data:
+  cache_path: data/slimpajama_627b/300m/train
+
+train:
+  pure_bf16: false        # fp32 master + bf16 residual
+  backend: nccl
+  batch_size: 4
+  seq_len: 2048
+  grad_accum: 8
+  total_tokens: 20_000_000
+  progress_interval: 5
+  save_interval: 100000
+  save_dir: runs/cmp_fp32
+  optimizer:
+    lr: 8.0e-5
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+  schedule:
+    warmup_steps: 4
+    peak_lr: 8.0e-5
+    min_lr: 8.0e-6

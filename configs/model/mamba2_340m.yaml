@@ -1,0 +1,22 @@
+name: mamba2_340m
+# Mamba2 baseline. No per-block MLP, so 2x depth (L48 vs the others' L24) to
+# match the ~340M param budget -- same convention as mamba2_200m. ~349.6M.
+hf_kwargs:
+  model_type: mamba2
+  hidden_size: 1024
+  num_hidden_layers: 48      # 2x to match params (no per-block MLP)
+  head_dim: 64
+  state_size: 128
+  expand: 2
+  n_groups: 1
+  conv_kernel: 4
+  chunk_size: 256
+  norm_eps: 1.0e-5
+  rmsnorm: true
+  residual_in_fp32: true
+  tie_word_embeddings: true
+  fuse_norm: true
+  fuse_cross_entropy: true
+  vocab_size: 32000
+  bos_token_id: 1
+  eos_token_id: 2

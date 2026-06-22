@@ -1,0 +1,51 @@
+# 340M GatedDeltaNet, SlimPajama 15B tokens, manual DDP trainer (train_llm.py).
+# Build model from `model.hf_kwargs`; pass `train` block to DDPLLMPretrainer.
+# tokens_per_step = batch_size * world_size * grad_accum * seq_len  (world set at runtime)
+#   4 GPU x bs16 x accum4 x 2048 = 524,288 tok/step ; 15B / 524288 ~= 28,610 steps.
+
+model:
+  hf_kwargs:
+    model_type: gated_deltanet
+    hidden_size: 1024
+    num_hidden_layers: 24
+    num_heads: 16
+    head_dim: 64
+    expand_v: 1.0
+    use_gate: true
+    use_short_conv: true
+    conv_size: 4
+    attn_mode: chunk
+    hidden_ratio: 4
+    hidden_act: swish
+    max_position_embeddings: 2048
+    norm_eps: 1.0e-6
+    tie_word_embeddings: true
+    fuse_norm: true
+    fuse_swiglu: true
+    fuse_cross_entropy: false           # mutually exclusive with the linear variant below
+    fuse_linear_cross_entropy: true     # 7x-lighter CE; out.logits is None when labels passed
+    vocab_size: 32000
+    bos_token_id: 1
+    eos_token_id: 2
+
+data:
+  cache_path: /buckets/workspace/linatt/data/slimpajama_15bt/train   # ~28GB; on /buckets
+
+train:
+  batch_size: 16          # micro-batch per GPU
+  seq_len: 2048
+  grad_accum: 4
+  total_tokens: 15_000_000_000
+  progress_interval: 50
+  save_interval: 5000
+  save_dir: /buckets/workspace/linatt/runs/gated_deltanet_340m_slim15b
+
+  optimizer:
+    lr: 3.0e-4
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+  schedule:
+    warmup_steps: 286     # ~1% of 28,610
+    peak_lr: 3.0e-4
+    min_lr: 3.0e-5

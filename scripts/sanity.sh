@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 
 ARCHS=("$@")
 if [ "${#ARCHS[@]}" -eq 0 ]; then
-    ARCHS=(transformer_200m gated_deltanet_200m delta_net_200m mamba2_200m)
+    ARCHS=(transformer_200m gated_deltanet_200m delta_net_200m mamba2_200m kata_200m kata_spd_200m)
 fi
 
 if [ -z "${NUM_GPUS:-}" ]; then

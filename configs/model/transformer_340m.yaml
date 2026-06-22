@@ -1,0 +1,23 @@
+name: transformer_340m
+# Full-attention transformer baseline. RoPE + QK-norm (LLaMA-style).
+hf_kwargs:
+  model_type: transformer
+  hidden_size: 1024
+  num_hidden_layers: 24
+  num_heads: 16
+  num_kv_heads: 16          # MHA (16 q heads = 16 kv heads; head_dim 64)
+  qkv_bias: false
+  qk_norm: true             # RMSNorm on q and k before dot-product
+  rope_theta: 10000.0
+  max_position_embeddings: 2048
+  window_size: null         # null = full attention; set to int for sliding window
+  hidden_ratio: 4
+  hidden_act: swish
+  norm_eps: 1.0e-6
+  tie_word_embeddings: true
+  fuse_norm: true
+  fuse_swiglu: true
+  fuse_cross_entropy: true
+  vocab_size: 32000
+  bos_token_id: 1
+  eos_token_id: 2

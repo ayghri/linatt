@@ -1,0 +1,12 @@
+name: slimpajama_15bt
+dataset: gmongaras/SlimPajama-627B_Reupload
+split: train
+seq_len: 2048
+target_tokens: 15_000_000_000
+tokenizer: TinyLlama/TinyLlama_v1.1
+output_root: data
+save_dir: ${.output_root}/slimpajama_627b
+shuffle_buffer: 50000
+log_every_blocks: 20000
+seed: ${seed}
+num_workers: 16

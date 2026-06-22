@@ -1,0 +1,32 @@
+name: kata_200m
+# Passed to AutoConfig.for_model(**hf_kwargs) -> KataConfig.
+#
+# Default feature_map='positive' (= linear-attn baseline w/ ReLU+eps). Switch
+# to 'spd_concat' for the paper claim (state-expansion via outer product).
+#   model.hf_kwargs.feature_map=spd_concat
+#   model.hf_kwargs.spd_num_groups=1
+# With head_k=64 and spd_num_groups=4 the per-group dim E=16, post-psi q=4*136=544.
+hf_kwargs:
+  model_type: kata
+  hidden_size: 768
+  num_hidden_layers: 24
+  num_heads: 12
+  expand_k: 1.0
+  expand_v: 1.0          # value_dim = 768; head_v_dim = 64
+  feature_map: positive  # positive | lorentz | spd_concat
+  spd_num_groups: 1
+  feature_map_eps: 1.0e-6
+  norm_q: false
+  norm_k: false
+  attn_mode: chunk
+  hidden_ratio: 4
+  hidden_act: swish
+  max_position_embeddings: 2048
+  norm_eps: 1.0e-6
+  tie_word_embeddings: true
+  fuse_norm: true
+  fuse_swiglu: true
+  fuse_cross_entropy: true
+  vocab_size: 32000
+  bos_token_id: 1
+  eos_token_id: 2

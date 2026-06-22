@@ -1,0 +1,32 @@
+name: kata_spd_sum_full_200m
+# 200M KATA-SPD-sum with FULL E×E storage (qd = E² = 256 at d_head=64, M=4)
+# instead of packed (qd = E(E+1)/2 = 136). Same math; pow-2 qd; tests
+# whether FLA chunk_linear_attn likes pow-2 tiles vs non-pow-2.
+hf_kwargs:
+  model_type: kata
+  hidden_size: 768
+  num_hidden_layers: 24
+  num_heads: 12
+  expand_k: 1.0
+  expand_v: 1.0
+  feature_map: spd_sum
+  spd_num_groups: 4
+  spd_use_kernel: false
+  feature_map_eps: 1.0e-4
+  norm_q: false
+  norm_k: false
+  use_short_conv: true
+  conv_size: 4
+  conv_bias: false
+  attn_mode: chunk
+  hidden_ratio: 4
+  hidden_act: swish
+  max_position_embeddings: 2048
+  norm_eps: 1.0e-6
+  tie_word_embeddings: true
+  fuse_norm: true
+  fuse_swiglu: true
+  fuse_cross_entropy: true
+  vocab_size: 32000
+  bos_token_id: 1
+  eos_token_id: 2
