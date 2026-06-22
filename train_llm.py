@@ -43,14 +43,15 @@ def init_dist(backend=None):
 
 
 class WarmedUpScheduler:
-    """Linear warmup (min_lr -> peak_lr) then cosine decay back to min_lr."""
+    """Linear warmup (min_lr -> peak_lr) then cosine decay back to min_lr,
+    where min_lr = min_lr_rate * peak_lr (peak_lr is the configured `lr`)."""
 
-    def __init__(self, optimizer, max_steps, warmup_steps, peak_lr, min_lr):
+    def __init__(self, optimizer, max_steps, warmup_steps, peak_lr, min_lr_rate):
         self.optimizer = optimizer
         self.max_steps = max_steps
         self.warmup_steps = warmup_steps
         self.peak_lr = peak_lr
-        self.min_lr = min_lr
+        self.min_lr = peak_lr * min_lr_rate
         self.update(0)  # prime lr for step 0 so update() runs AFTER optimizer.step()
 
     def get_lr(self, t):
@@ -118,14 +119,16 @@ class DDPLLMPretrainer:
         )
         self.optimizer = AdamW(
             self.model.parameters(),
-            **OmegaConf.to_container(tr.optimizer, resolve=True),
+            lr=float(tr.lr),                 # peak; overwritten each step by scheduler
+            betas=tuple(tr.betas),
+            weight_decay=float(tr.weight_decay),
         )
         self.scheduler = WarmedUpScheduler(
             self.optimizer,
             max_steps=self.max_steps,
             warmup_steps=self.warmup_steps,
-            peak_lr=float(tr.peak_lr),
-            min_lr=float(tr.min_lr),
+            peak_lr=float(tr.lr),
+            min_lr_rate=float(tr.min_lr_rate),
         )
 
         if self.is_main():

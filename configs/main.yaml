@@ -5,7 +5,7 @@
 defaults:
   - model: gated_deltanet_340m
   - data: slimpajama_15bt
-  - train: default
+  - train: manual
   - _self_
 
 run_name: ${model.name}_${data.name}
