@@ -1,26 +1,29 @@
-"""Entry point: build an fla model + load tokenized dataset, train via the manual
-DDP trainer (train_llm.DDPLLMPretrainer).
-include CUDA HOME for tilelang
+"""Manual DDP LLM pretrainer. fp32 master + bf16 compute (autocast) + bf16
+residual via an embedding-output cast. Loads the per-doc packed shards written
+by prepare_data.py and trains with wandb logging (loss, grad_norm, lr, tok/s).
 
-Launch (see launch_llm.sh):
+Launch (CUDA_HOME needed for fla's tilelang GDN backward):
     CUDA_HOME=/media/misc/envs/cuda PATH=$CUDA_HOME/bin:$PATH \
-    torchrun --nproc_per_node=4 train_llm.py conf_llm/gated_deltanet_340m_slim15b.yaml
+    torchrun --nproc_per_node=8 train_llm.py \
+        model=gated_deltanet_340m data=slimpajama_15bt train=manual
 """
 
+import glob
 import math
 import os
-import sys
+import time
 from contextlib import nullcontext
 
+import hydra
 import torch
 import torch.distributed as dist
-from datasets import load_from_disk
-from omegaconf import OmegaConf
+import wandb
+from datasets import concatenate_datasets, load_from_disk
+from omegaconf import DictConfig, OmegaConf
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
-
 from transformers import AutoConfig, AutoModelForCausalLM
 
 import fla_patches  # noqa: F401  -- kata + SDPA shim
@@ -36,43 +39,64 @@ def init_dist(backend=None):
     dist.init_process_group(backend)
     rank = dist.get_rank()
     device = torch.device(accelerator.type, local_rank)  # type: ignore
-
     return device, local_rank, rank, dist.get_world_size()
 
 
 class WarmedUpScheduler:
+    """Linear warmup (min_lr -> peak_lr) then cosine decay back to min_lr."""
 
     def __init__(self, optimizer, max_steps, warmup_steps, peak_lr, min_lr):
-
         self.optimizer = optimizer
         self.max_steps = max_steps
         self.warmup_steps = warmup_steps
         self.peak_lr = peak_lr
         self.min_lr = min_lr
-        self.update(0)
+        self.update(0)  # prime lr for step 0 so update() runs AFTER optimizer.step()
+
+    def get_lr(self, t):
+        if t < self.warmup_steps:
+            return self.min_lr + (self.peak_lr - self.min_lr) * t / max(
+                1, self.warmup_steps
+            )
+        p = (t - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps)
+        return (
+            self.min_lr + (1 + math.cos(math.pi * p)) * (self.peak_lr - self.min_lr) / 2
+        )
 
     def update(self, t):
-        for p_group in self.optimizer.param_groups:
-            if t < self.warmup_steps:
-                p_group["lr"] = self.min_lr + (self.peak_lr - self.min_lr) * t / max(
-                    1, self.warmup_steps
-                )
-            else:
-                p = (t - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps)
-                p_group["lr"] = (
-                    self.min_lr
-                    + (1 + math.cos(math.pi * p)) * (self.peak_lr - self.min_lr) / 2
-                )
+        lr = self.get_lr(t)
+        for g in self.optimizer.param_groups:
+            g["lr"] = lr
+        return lr
 
 
 class DDPLLMPretrainer:
 
-    def __init__(self, model, dataset, config):
-
-        self.config = config
+    def __init__(self, model, dataset, cfg):
+        self.cfg = cfg
+        tr, data = cfg.train, cfg.data
         self.device, self.local_rank, self.rank, self.world_size = init_dist(
-            config.get("backend", None)
+            tr.get("backend", None)
         )
+
+        # batch_size/GPU is derived from the token budget, not configured directly.
+        self.tokens_per_step = int(tr.tokens_per_step)
+        self.grad_accum = int(tr.grad_accum)
+        self.seq_len = int(data.seq_len)
+        self.batch_size = (
+            self.tokens_per_step // self.world_size // self.grad_accum // self.seq_len
+        )
+        assert (
+            self.batch_size > 0
+        ), "tokens_per_step too small for world*grad_accum*seq_len"
+
+        self.max_steps = int(data.target_tokens) // self.tokens_per_step
+        self.warmup_steps = int(tr.warmup_tokens) // self.tokens_per_step
+        self.progress_interval = int(tr.progress_interval)
+        self.save_interval = int(tr.save_interval)
+        self.max_grad_norm = float(tr.max_grad_norm)
+        self.save_dir = cfg.output_dir
+
         self.sampler = DistributedSampler(
             dataset,
             num_replicas=self.world_size,
@@ -82,150 +106,159 @@ class DDPLLMPretrainer:
         )
         self.dataloader = DataLoader(
             dataset,
-            batch_size=config.batch_size,
+            batch_size=self.batch_size,
             sampler=self.sampler,
             num_workers=4,
             pin_memory=True,
-        )
-        model = model.to(self.device)
-
-        self.tokens_per_step_worker = (
-            self.config.train.tokens_per_step / self.world_size / config.grad_accum
-        )
-        self.batch_size = (
-            self.tokens_per_step_worker + config.data.seq_len - 1
-        ) // config.data.seq_len
-
-        self.wamup_steps = (
-            config.train.warmup_tokens / self.config.train.tokens_per_step
-        )
-        self.max_steps = (
-            self.config.data.total_tokens // self.config.train.tokens_per_step
+            drop_last=True,
         )
 
-        self.model = DistributedDataParallel(model, device_ids=[self.local_rank])
+        self.model = DistributedDataParallel(
+            model.to(self.device), device_ids=[self.local_rank]
+        )
         self.optimizer = AdamW(
             self.model.parameters(),
-            **OmegaConf.to_container(config.optimizer, resolve=True),
+            **OmegaConf.to_container(tr.optimizer, resolve=True),
         )
         self.scheduler = WarmedUpScheduler(
             self.optimizer,
             max_steps=self.max_steps,
-            warmup_steps=self.wamup_steps,
-            peak_lr=config.train.peak_lr,
-            min_lr=config.train.min_lr,
+            warmup_steps=self.warmup_steps,
+            peak_lr=float(tr.peak_lr),
+            min_lr=float(tr.min_lr),
         )
 
+        if self.is_main():
+            wandb.init(
+                project=cfg.wandb.project,
+                entity=cfg.wandb.entity,
+                mode=cfg.wandb.mode,
+                name=cfg.run_name,
+                config=OmegaConf.to_container(cfg, resolve=True),
+            )
+            print(
+                f"batch_size/GPU={self.batch_size}  max_steps={self.max_steps}  "
+                f"warmup_steps={self.warmup_steps}  tokens/step={self.tokens_per_step}"
+            )
+
     def is_main(self):
-        return self.local_rank == 0
+        return self.rank == 0
 
     def save_checkpoint(self, step):
         if not self.is_main():
             return
-        os.makedirs(self.config.save_dir, exist_ok=True)
-        path = os.path.join(self.config.save_dir, f"step_{step}.pt")
+        os.makedirs(self.save_dir, exist_ok=True)
         torch.save(
             {
                 "step": step,
                 "model": self.model.module.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
             },
-            path,
+            os.path.join(self.save_dir, f"step_{step}.pt"),
         )
 
     def train(self):
-
         self.model.train()
-
-        assert self.max_steps <= len(self.dataloader) // self.config.grad_accum
+        assert self.max_steps <= len(self.dataloader) // self.grad_accum, (
+            f"need {self.max_steps} steps but only "
+            f"{len(self.dataloader) // self.grad_accum} available"
+        )
 
         pbar = tqdm(range(self.max_steps), disable=not self.is_main())
         loader = iter(self.dataloader)
+        t_last = time.perf_counter()
 
         for step in pbar:
             self.optimizer.zero_grad()
             step_loss = torch.zeros((), device=self.device)
-            for grad_step in range(self.config.grad_accum):
-                sync = grad_step == self.config.grad_accum - 1
+            for g in range(self.grad_accum):
+                sync = g == self.grad_accum - 1
                 try:
                     input_ids = next(loader)["input_ids"].to(
                         self.device, non_blocking=True
                     )
                 except StopIteration:
-                    if self.is_main():
-                        print(
-                            "No more batches to use bro! check your token counts! rescuing this by re-using the data"
-                        )
                     loader = iter(self.dataloader)
                     input_ids = next(loader)["input_ids"].to(
                         self.device, non_blocking=True
                     )
-                ctx = nullcontext()
-                if not sync:
-                    ctx = self.model.no_sync()
+                ctx = nullcontext() if sync else self.model.no_sync()
                 with ctx:
-                    # bf16 compute (matmuls/kv), fp32 master+grads. Residual is
-                    # bf16 via the embedding-output cast hook set in run_llm.py.
                     with torch.autocast(self.device.type, dtype=torch.bfloat16):
                         loss = (
                             self.model(input_ids=input_ids, labels=input_ids).loss
-                            / self.config.grad_accum
+                            / self.grad_accum
                         )
                     loss.backward()
                 step_loss += loss.detach()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            self.scheduler.update(step + 1)  # step 0 lr primed at init; advance to next
 
-            if (step + 1) % self.config.progress_interval == 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.max_grad_norm
+            )
+            self.optimizer.step()
+            lr = self.scheduler.update(
+                step + 1
+            )  # step 0 primed at init; advance to next
+
+            if (step + 1) % self.progress_interval == 0:
                 dist.all_reduce(step_loss, op=dist.ReduceOp.AVG)
                 if self.is_main():
-                    pbar.set_postfix({"loss": f"{step_loss.item():.4f}"})
+                    now = time.perf_counter()
+                    tok_per_sec = (
+                        self.progress_interval * self.tokens_per_step / (now - t_last)
+                    )
+                    t_last = now
+                    metrics = {
+                        "loss": step_loss.item(),
+                        "grad_norm": grad_norm.item(),
+                        "lr": lr,
+                        "tokens_per_sec": tok_per_sec,
+                        "tokens_seen": (step + 1) * self.tokens_per_step,
+                    }
+                    wandb.log(metrics, step=step + 1)
+                    pbar.set_postfix(
+                        {
+                            "loss": f"{step_loss.item():.4f}",
+                            "tok/s": f"{tok_per_sec/1e3:.0f}k",
+                        }
+                    )
 
-            if (step + 1) % self.config.save_interval == 0:
+            if (step + 1) % self.save_interval == 0:
                 self.save_checkpoint(step + 1)
 
         self.save_checkpoint(self.max_steps)
+        if self.is_main():
+            wandb.finish()
         dist.destroy_process_group()
 
 
-def main():
-    cfg_path = (
-        sys.argv[1]
-        if len(sys.argv) > 1
-        else ("conf_llm/gated_deltanet_340m_slim15b.yaml")
-    )
-    cfg = OmegaConf.load(cfg_path)
+def load_sharded_dataset(save_dir):
+    """Concatenate the per-worker shards prepare_data.py wrote to {save_dir}_shards."""
+    shard_paths = sorted(glob.glob(os.path.join(save_dir + "_shards", "shard_*")))
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"No shards at {save_dir}_shards/shard_*. Run: python prepare_data.py"
+        )
+    ds = concatenate_datasets([load_from_disk(p) for p in shard_paths])
+    return ds.with_format("torch", columns=["input_ids"])
 
-    # ---- model (random init, from_config) ----
-    # fp32 MASTER weights; bf16 compute via autocast in the train loop. The
-    # embedding-output cast below makes the residual stream bf16 (low activation
-    # memory, nanochat-style) WITHOUT downcasting any weight -- so every param
-    # keeps an fp32 master + fp32 grad, including the tied embed/lm_head.
+
+@hydra.main(version_base=None, config_path="configs", config_name="main.yaml")
+def main(cfg: DictConfig) -> None:
+    # ---- model: fp32 MASTER weights; bf16 compute via autocast in the loop. ----
     hf_kwargs = OmegaConf.to_container(cfg.model.hf_kwargs, resolve=True)
-    hf_cfg = AutoConfig.for_model(**hf_kwargs)
-    model = AutoModelForCausalLM.from_config(hf_cfg)  # fp32 master
+    model = AutoModelForCausalLM.from_config(AutoConfig.for_model(**hf_kwargs))
     if cfg.train.get("pure_bf16", False):
-        # A/B control: bf16 MASTER weights (the defective recipe). Demonstrates
-        # the low-LR frozen-param effect. autocast in the loop is then ~no-op.
-        model = model.to(torch.bfloat16)
+        model = model.to(torch.bfloat16)  # A/B control: bf16 master (defective)
     else:
-        # fp32 master + bf16 residual via embedding-output cast (no weight downcast).
+        # bf16 residual via embedding-output cast; weights stay fp32 (fp32 master + grad).
         model.model.embeddings.register_forward_hook(
             lambda mod, inp, out: out.to(torch.bfloat16)
         )
 
-    # ---- dataset (pre-tokenized, packed seq_len blocks) ----
-    if not os.path.exists(cfg.data.cache_path):
-        raise FileNotFoundError(
-            f"Tokenized dataset not found at {cfg.data.cache_path}. "
-            f"Run: python prepare_slimpajama.py data=slimpajama_15bt"
-        )
-    ds = load_from_disk(cfg.data.cache_path)
-    ds = ds.with_format("torch", columns=["input_ids"])  # rows -> {"input_ids": tensor}
+    dataset = load_sharded_dataset(cfg.data.save_dir)
 
-    # ---- train (DDP init happens inside the trainer) ----
-    trainer = DDPLLMPretrainer(model, ds, cfg.train)
+    trainer = DDPLLMPretrainer(model, dataset, cfg)
     trainer.train()
 
 
