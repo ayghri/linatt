@@ -7,6 +7,7 @@ Usage:
         data.save_dir=/buckets/workspace/linatt/data/slimpajama_15bt/train
 """
 
+import glob
 import math
 import multiprocessing as mp
 import os
@@ -52,7 +53,7 @@ class ShardedDatasetStream:
         self.text_buffer.clear()
         n = len(self.token_buffer) // self.seq_len
         for i in range(n):
-            if self.produced_blocks > self.target_blocks:
+            if self.produced_blocks >= self.target_blocks:
                 return
             yield {
                 "input_ids": self.token_buffer[
@@ -60,7 +61,9 @@ class ShardedDatasetStream:
                 ]
             }
             self.produced_blocks += 1
-        self.text_buffer.clear()
+        # Trim the consumed whole blocks; keep the remainder for the next flush
+        # (continuous packing -> no duplicates, bounded buffer).
+        del self.token_buffer[: n * self.seq_len]
 
     def generate_samples(self):
         for example in self.stream:
@@ -112,14 +115,14 @@ def main(cfg: DictConfig) -> None:
     data_cfg = cfg.data
     print(OmegaConf.to_yaml(data_cfg))
 
-    if os.path.exists(data_cfg.save_dir):
-        print(f"Cache exists at {data_cfg.save_dir} -- nothing to do.")
+    shard_dir = data_cfg.save_dir
+    if glob.glob(os.path.join(shard_dir, "shard_*")):
+        print(f"Shards already exist in {shard_dir} -- nothing to do.")
         return
 
     num_workers = data_cfg.num_workers
     total_blocks = math.ceil(int(data_cfg.target_tokens) / data_cfg.seq_len)
     per_worker = math.ceil(total_blocks / num_workers)
-    shard_dir = data_cfg.save_dir + "_shards"
     os.makedirs(shard_dir, exist_ok=True)
 
     print(

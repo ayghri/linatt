@@ -94,7 +94,8 @@ class DDPLLMPretrainer:
         self.max_steps = int(data.target_tokens) // self.tokens_per_step
         self.warmup_steps = int(tr.warmup_tokens) // self.tokens_per_step
         self.progress_interval = int(tr.progress_interval)
-        self.save_interval = int(tr.save_interval)
+        # checkpoint every checkpoint_rate * max_steps steps (+ step 0 and last).
+        self.checkpoint_interval = max(1, round(float(cfg.checkpoint_rate) * self.max_steps))
         self.max_grad_norm = float(tr.max_grad_norm)
         self.save_dir = cfg.output_dir
 
@@ -171,6 +172,8 @@ class DDPLLMPretrainer:
         loader = iter(self.dataloader)
         t_last = time.perf_counter()
 
+        self.save_checkpoint(0)  # sanity: checkpoint the random init at step 0
+
         for step in pbar:
             self.optimizer.zero_grad()
             step_loss = torch.zeros((), device=self.device)
@@ -203,30 +206,35 @@ class DDPLLMPretrainer:
                 step + 1
             )  # step 0 primed at init; advance to next
 
-            if (step + 1) % self.progress_interval == 0:
-                dist.all_reduce(step_loss, op=dist.ReduceOp.AVG)
-                if self.is_main():
-                    now = time.perf_counter()
-                    tok_per_sec = (
-                        self.progress_interval * self.tokens_per_step / (now - t_last)
-                    )
-                    t_last = now
-                    metrics = {
-                        "loss": step_loss.item(),
-                        "grad_norm": grad_norm.item(),
-                        "lr": lr,
-                        "tokens_per_sec": tok_per_sec,
-                        "tokens_seen": (step + 1) * self.tokens_per_step,
-                    }
-                    wandb.log(metrics, step=step + 1)
-                    pbar.set_postfix(
-                        {
-                            "loss": f"{step_loss.item():.4f}",
-                            "tok/s": f"{tok_per_sec/1e3:.0f}k",
-                        }
-                    )
+            # Cross-worker reduced loss only every progress_interval -- all_reduce is
+            # a collective, so ALL ranks must call it (outside the is_main guard).
+            log_reduced = (step + 1) % self.progress_interval == 0
+            if log_reduced:
+                reduced = step_loss.detach().clone()
+                dist.all_reduce(reduced, op=dist.ReduceOp.AVG)
 
-            if (step + 1) % self.save_interval == 0:
+            if self.is_main():
+                now = time.perf_counter()
+                tok_per_sec = self.tokens_per_step / (now - t_last)
+                t_last = now
+                metrics = {
+                    "loss": step_loss.item(),  # worker-0 local loss, EVERY step
+                    "grad_norm": grad_norm.item(),
+                    "lr": lr,
+                    "tokens_per_sec": tok_per_sec,
+                    "tokens_seen": (step + 1) * self.tokens_per_step,
+                }
+                if log_reduced:
+                    metrics["loss_reduced"] = reduced.item()  # mean across workers
+                wandb.log(metrics, step=step + 1)
+                pbar.set_postfix(
+                    {
+                        "loss": f"{step_loss.item():.4f}",
+                        "tok/s": f"{tok_per_sec/1e3:.0f}k",
+                    }
+                )
+
+            if (step + 1) % self.checkpoint_interval == 0:
                 self.save_checkpoint(step + 1)
 
         self.save_checkpoint(self.max_steps)
@@ -236,11 +244,11 @@ class DDPLLMPretrainer:
 
 
 def load_sharded_dataset(save_dir):
-    """Concatenate the per-worker shards prepare_data.py wrote to {save_dir}_shards."""
+    """Concatenate the per-worker shards prepare_data.py wrote to {save_dir}/shard_*."""
     shard_paths = sorted(glob.glob(os.path.join(save_dir, "shard_*")))
     if not shard_paths:
         raise FileNotFoundError(
-            f"No shards at {save_dir}_shards/shard_*. Run: python prepare_data.py"
+            f"No shards at {save_dir}/shard_*. Run: python prepare_data.py"
         )
     ds = concatenate_datasets([load_from_disk(p) for p in shard_paths])
     return ds.with_format("torch", columns=["input_ids"])
@@ -249,6 +257,9 @@ def load_sharded_dataset(save_dir):
 @hydra.main(version_base=None, config_path="configs", config_name="main.yaml")
 def main(cfg: DictConfig) -> None:
     # ---- model: fp32 MASTER weights; bf16 compute via autocast in the loop. ----
+    # fla's fused triton kernels (norm/swiglu/(linear-)CE + chunk-scan mixer) are
+    # the optimization; we run them eager (no torch.compile -- Inductor can't
+    # trace them and only fuses un-fused ops, of which fla leaves none).
     hf_kwargs = OmegaConf.to_container(cfg.model.hf_kwargs, resolve=True)
     model = AutoModelForCausalLM.from_config(AutoConfig.for_model(**hf_kwargs))
     if cfg.train.get("pure_bf16", False):
