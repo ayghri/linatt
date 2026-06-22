@@ -119,7 +119,7 @@ class DDPLLMPretrainer:
         )
         self.optimizer = AdamW(
             self.model.parameters(),
-            lr=float(tr.lr),                 # peak; overwritten each step by scheduler
+            lr=float(tr.lr),  # peak; overwritten each step by scheduler
             betas=tuple(tr.betas),
             weight_decay=float(tr.weight_decay),
         )
@@ -237,7 +237,7 @@ class DDPLLMPretrainer:
 
 def load_sharded_dataset(save_dir):
     """Concatenate the per-worker shards prepare_data.py wrote to {save_dir}_shards."""
-    shard_paths = sorted(glob.glob(os.path.join(save_dir + "_shards", "shard_*")))
+    shard_paths = sorted(glob.glob(os.path.join(save_dir, "shard_*")))
     if not shard_paths:
         raise FileNotFoundError(
             f"No shards at {save_dir}_shards/shard_*. Run: python prepare_data.py"
