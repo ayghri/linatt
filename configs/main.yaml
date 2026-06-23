@@ -29,8 +29,6 @@ eval:
     - arc_easy
     - arc_challenge
     - boolq
-    - gpqa
-    - ifeval
     # acc + perplexity
     - lambada_openai
     # word_perplexity / byte_perplexity / bits_per_byte

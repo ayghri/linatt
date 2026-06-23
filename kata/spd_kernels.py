@@ -1,6 +1,6 @@
 """Triton kernels for SPD chunked linear attention with on-the-fly SRAM
 expansion. Supports multi-group SPD (M groups, each of dim E = head_k / M)
-and DV tiling.
+and d_v tiling.
 
 State representation: full per-group outer products, no sqrt(2) packing.
 For each group m, psi_full(g_m) = vec(g_m g_m^T) of dim E^2. Multi-group concat
@@ -12,18 +12,18 @@ Memory budgets that drove block-size choices on 3090 (100 KB shared / SM):
     chunk_output: tiles per program kept under ~80 KB:
         Q_full (C, ME)     C=32, M=4, E=16 -> 8 KB
         K_full (C, ME)                     -> 8 KB
-        V_tile (C, DV_BLK) DV_BLK=16       -> 2 KB
-        S_tile (E*E, DV_BLK)               -> 16 KB
+        V_tile (C, d_v_BLK) d_v_BLK=16       -> 2 KB
+        S_tile (E*E, d_v_BLK)               -> 16 KB
         Q_outer_g (C, E*E) (per-group)     -> 32 KB
         QK + A2 (C, C)                     -> 8 KB
         ...
-    Looping over (M groups) and (DV tiles) keeps largest live tile to a
+    Looping over (M groups) and (d_v tiles) keeps largest live tile to a
     single group's Q_outer + S_tile.
 
 Constraints:
 - T % C == 0, NC = T/C must be power of 2
 - E >= 16 (Triton tl.dot inner-dim min) -> head_k / M >= 16
-- DV % DV_BLK == 0
+- d_v % d_v_BLK == 0
 - ME = M*E (= head_k_dim) loaded as (C, ME); subselected per group with E
   constexpr offsets.
 
@@ -49,36 +49,36 @@ import triton.language as tl
 
 # Autotune configs. Triton picks the fastest per (key) combination at first
 # call; subsequent calls with the same key reuse the cached choice.
-# DV_BLK is the inner-loop tile over the value dim; (num_warps, num_stages)
-# control GPU resource use. Larger DV_BLK -> fewer iterations / more SRAM;
-# smaller DV_BLK -> more iterations / less SRAM. Autotune walks both.
+# d_v_BLK is the inner-loop tile over the value dim; (num_warps, num_stages)
+# control GPU resource use. Larger d_v_BLK -> fewer iterations / more SRAM;
+# smaller d_v_BLK -> more iterations / less SRAM. Autotune walks both.
 
-_SPD_CONFIGS_DV = [
+_SPD_CONFIGS_d_v = [
     # Single-config "no-op" autotune: avoids the slow first-call compile across
     # multiple configs while still letting us upgrade to a real sweep later.
-    # DV_BLK >= 16 (inner-dim min for tl.dot in bwd kernels).
+    # d_v_BLK >= 16 (inner-dim min for tl.dot in bwd kernels).
     # num_stages=1 only — pipelining caused cross-call data corruption.
-    triton.Config({"DV_BLK": 16}, num_warps=4, num_stages=1),
+    triton.Config({"d_v_BLK": 16}, num_warps=4, num_stages=1),
 ]
 _SPD_CONFIGS_SCAN = [
     triton.Config({}, num_warps=4, num_stages=1),
 ]
 # Autotune key: anything that affects shape / generated code paths.
-_SPD_KEY = ["T", "NC", "C", "ME", "M", "DV"]
-_SPD_KEY_SCAN = ["NC", "Q_TOTAL", "DV"]
+_SPD_KEY = ["T", "NC", "C", "ME", "M", "d_v"]
+_SPD_KEY_SCAN = ["NC", "Q_TOTAL", "d_v"]
 
 
 def _spd_dv_prune(configs, named_args, **kwargs):
-    """Drop configs whose DV_BLK > actual DV (would produce 0-iter loops).
+    """Drop configs whose d_v_BLK > actual d_v (would produce 0-iter loops).
 
-    DV is a constexpr passed to the kernel; in early_config_prune it shows up
+    d_v is a constexpr passed to the kernel; in early_config_prune it shows up
     in either named_args (positional/keyword) or kwargs (constexpr from
     autotune call site).
     """
-    DV = named_args.get("DV", kwargs.get("DV"))
-    if DV is None:
+    d_v = named_args.get("d_v", kwargs.get("d_v"))
+    if d_v is None:
         return configs
-    return [c for c in configs if c.kwargs.get("DV_BLK", DV) <= DV]
+    return [c for c in configs if c.kwargs.get("d_v_BLK", d_v) <= d_v]
 
 
 # =====================================================================
@@ -87,110 +87,112 @@ def _spd_dv_prune(configs, named_args, **kwargs):
 
 
 @triton.autotune(
-    configs=_SPD_CONFIGS_DV,
+    configs=_SPD_CONFIGS_d_v,
     key=_SPD_KEY,
     prune_configs_by={"early_config_prune": _spd_dv_prune},
 )
 @triton.jit
 def spd_chunk_state_kernel(
-    K_ptr,
-    V_ptr,
-    S_ptr,
-    Z_ptr,
-    H,
+    K_addr,
+    V_addr,
+    S_addr,
+    Z_addr,
+    num_heads,
     T,
-    NC,
-    C: tl.constexpr,
+    num_chunks,
+    chunk_size: tl.constexpr,
     ME: tl.constexpr,
     E: tl.constexpr,
-    M: tl.constexpr,
-    DV: tl.constexpr,
+    num_groups: tl.constexpr,
+    d_v: tl.constexpr,
     Q_PER_G: tl.constexpr,
-    DV_BLK: tl.constexpr,
+    d_v_BLK: tl.constexpr,
 ):
     """Per-chunk per-group state local statistics:
         S_local[c, m, q, d]  +=  K_outer_g[i, j]  *  V[c, d]
         Z_local[c, m, q]     +=  K_outer_g[i, j]
     where K_outer_g = K_g outer K_g flattened to E^2 = Q_PER_G.
 
-    Loops: M groups (outer) -> DV tiles (inner). Each program does one
+    Loops: M groups (outer) -> d_v tiles (inner). Each program does one
     (b, h, nc) chunk.
     Grid: (B*H, NC).
 
-    State layout: S[B, H, NC, M*Q_PER_G, DV] flat-concat over M groups.
+    State layout: S[B, H, NC, M*Q_PER_G, d_v] flat-concat over M groups.
                   Z[B, H, NC, M*Q_PER_G] same.
     """
     pid_bh = tl.program_id(0)
     pid_nc = tl.program_id(1)
-    b = pid_bh // H
-    h = pid_bh % H
+    b = pid_bh // num_heads
+    h = pid_bh % num_heads
 
-    offs_c = tl.arange(0, C)
+    offs_c = tl.arange(0, chunk_size)
     offs_e = tl.arange(0, E)
     offs_q_pg = tl.arange(0, Q_PER_G)
-    t_idx = pid_nc * C + offs_c
+    t_idx = pid_nc * chunk_size + offs_c
 
-    Q_TOTAL: tl.constexpr = M * Q_PER_G
+    Q_TOTAL: tl.constexpr = num_groups * Q_PER_G
 
-    for m_id in tl.static_range(M):
+    for m_id in tl.static_range(num_groups):
         # K_g[c, e] = K[b, t_idx, h, m_id*E + e]
         k_off = (
-            b * T * H * ME
-            + t_idx[:, None] * H * ME
+            b * T * num_heads * ME
+            + t_idx[:, None] * num_heads * ME
             + h * ME
             + m_id * E
             + offs_e[None, :]
         )
-        K_g = tl.load(K_ptr + k_off).to(tl.float32)  # (C, E)
+        K_g = tl.load(K_addr + k_off).to(tl.float32)  # (C, E)
 
         K_outer = K_g[:, :, None] * K_g[:, None, :]  # (C, E, E)
-        K_flat = tl.reshape(K_outer, (C, Q_PER_G))  # (C, Q_PER_G)
+        K_flat = tl.reshape(K_outer, (chunk_size, Q_PER_G))  # (C, Q_PER_G)
 
         # Z_local for this group (E^2,)
         Z_g = tl.sum(K_flat, axis=0)
         z_off = (
-            b * H * NC * Q_TOTAL
-            + h * NC * Q_TOTAL
+            b * num_heads * num_chunks * Q_TOTAL
+            + h * num_chunks * Q_TOTAL
             + pid_nc * Q_TOTAL
             + m_id * Q_PER_G
             + offs_q_pg
         )
-        tl.store(Z_ptr + z_off, Z_g)
+        tl.store(Z_addr + z_off, Z_g)
 
-        # DV-tiled S_local: S_g_tile = K_flat^T @ V_tile, store per tile.
-        for dv_id in tl.static_range(DV // DV_BLK):
-            offs_dv = dv_id * DV_BLK + tl.arange(0, DV_BLK)
-            v_off = b * T * H * DV + t_idx[:, None] * H * DV + h * DV + offs_dv[None, :]
-            V_tile = tl.load(V_ptr + v_off).to(tl.float32)  # (C, DV_BLK)
+        # d_v-tiled S_local: S_g_tile = K_flat^T @ V_tile, store per tile.
+        for dv_id in tl.static_range(d_v // d_v_BLK):
+            offs_dv = dv_id * d_v_BLK + tl.arange(0, d_v_BLK)
+            v_off = (
+                b * T * num_heads * d_v + t_idx[:, None] * num_heads * d_v + h * d_v + offs_dv[None, :]
+            )
+            V_tile = tl.load(V_addr + v_off).to(tl.float32)  # (C, d_v_BLK)
 
             S_tile = tl.dot(
                 tl.trans(K_flat), V_tile, allow_tf32=False
-            )  # (Q_PER_G, DV_BLK)
+            )  # (Q_PER_G, d_v_BLK)
 
             s_off = (
-                b * H * NC * Q_TOTAL * DV
-                + h * NC * Q_TOTAL * DV
-                + pid_nc * Q_TOTAL * DV
-                + (m_id * Q_PER_G + offs_q_pg)[:, None] * DV
+                b * num_heads * num_chunks * Q_TOTAL * d_v
+                + h * num_chunks * Q_TOTAL * d_v
+                + pid_nc * Q_TOTAL * d_v
+                + (m_id * Q_PER_G + offs_q_pg)[:, None] * d_v
                 + offs_dv[None, :]
             )
-            tl.store(S_ptr + s_off, S_tile)
+            tl.store(S_addr + s_off, S_tile)
 
 
 @triton.autotune(configs=_SPD_CONFIGS_SCAN, key=_SPD_KEY_SCAN)
 @triton.jit
 def spd_chunk_scan_linear_kernel(
-    S_local_ptr,
-    Z_local_ptr,
-    S_prefix_ptr,
-    Z_prefix_ptr,
-    S_init_ptr,
-    Z_init_ptr,
+    S_local_addr,
+    Z_local_addr,
+    S_prefix_addr,
+    Z_prefix_addr,
+    S_init_addr,
+    Z_init_addr,
     H,
     HAS_INIT: tl.constexpr,
     NC: tl.constexpr,
     Q_TOTAL: tl.constexpr,
-    DV: tl.constexpr,
+    d_v: tl.constexpr,
 ):
     """Linear (sequential) scan: each program loops chunks 0..NC-1 in order,
     accumulating Z and S states. O(NC) work per program — what standard
@@ -202,52 +204,52 @@ def spd_chunk_scan_linear_kernel(
     b = pid_bh // H
     h = pid_bh % H
 
-    offs_dv = tl.arange(0, DV)
+    offs_dv = tl.arange(0, d_v)
 
     if HAS_INIT:
         z_init_off = b * H * Q_TOTAL + h * Q_TOTAL + q_idx
-        s_init_off = b * H * Q_TOTAL * DV + h * Q_TOTAL * DV + q_idx * DV + offs_dv
-        z_acc = tl.load(Z_init_ptr + z_init_off)
-        s_acc = tl.load(S_init_ptr + s_init_off)
+        s_init_off = b * H * Q_TOTAL * d_v + h * Q_TOTAL * d_v + q_idx * d_v + offs_dv
+        z_acc = tl.load(Z_init_addr + z_init_off)
+        s_acc = tl.load(S_init_addr + s_init_off)
     else:
         z_acc = tl.zeros([], dtype=tl.float32)
-        s_acc = tl.zeros((DV,), dtype=tl.float32)
+        s_acc = tl.zeros((d_v,), dtype=tl.float32)
 
     # tl.range = non-unrolling loop; forces a true sequential O(NC) scan,
     # which is what we want to compare against the parallel tl.cumsum.
     for c in tl.range(0, NC):
         z_off = b * H * NC * Q_TOTAL + h * NC * Q_TOTAL + c * Q_TOTAL + q_idx
         s_off = (
-            b * H * NC * Q_TOTAL * DV
-            + h * NC * Q_TOTAL * DV
-            + c * Q_TOTAL * DV
-            + q_idx * DV
+            b * H * NC * Q_TOTAL * d_v
+            + h * NC * Q_TOTAL * d_v
+            + c * Q_TOTAL * d_v
+            + q_idx * d_v
             + offs_dv
         )
-        tl.store(Z_prefix_ptr + z_off, z_acc)
-        tl.store(S_prefix_ptr + s_off, s_acc)
-        z_acc = z_acc + tl.load(Z_local_ptr + z_off)
-        s_acc = s_acc + tl.load(S_local_ptr + s_off)
+        tl.store(Z_prefix_addr + z_off, z_acc)
+        tl.store(S_prefix_addr + s_off, s_acc)
+        z_acc = z_acc + tl.load(Z_local_addr + z_off)
+        s_acc = s_acc + tl.load(S_local_addr + s_off)
 
 
 @triton.autotune(configs=_SPD_CONFIGS_SCAN, key=_SPD_KEY_SCAN)
 @triton.jit
 def spd_chunk_scan_kernel(
-    S_local_ptr,
-    Z_local_ptr,
-    S_prefix_ptr,
-    Z_prefix_ptr,
-    S_init_ptr,
-    Z_init_ptr,
+    S_local_addr,
+    Z_local_addr,
+    S_prefix_addr,
+    Z_prefix_addr,
+    S_init_addr,
+    Z_init_addr,
     H,
     HAS_INIT: tl.constexpr,
     NC: tl.constexpr,
     Q_TOTAL: tl.constexpr,
-    DV: tl.constexpr,
+    d_v: tl.constexpr,
 ):
     """Exclusive prefix sum along NC. Grid: (B*H, Q_TOTAL).
-    Each program handles one (b, h, q_idx); loops over DV in scan kernel
-    is small (DV up to 64) so we don't tile here.
+    Each program handles one (b, h, q_idx); loops over d_v in scan kernel
+    is small (d_v up to 64) so we don't tile here.
     """
     pid_bh = tl.program_id(0)
     q_idx = tl.program_id(1)
@@ -255,42 +257,42 @@ def spd_chunk_scan_kernel(
     h = pid_bh % H
 
     offs_nc = tl.arange(0, NC)
-    offs_dv = tl.arange(0, DV)
+    offs_dv = tl.arange(0, d_v)
 
     z_off = b * H * NC * Q_TOTAL + h * NC * Q_TOTAL + offs_nc * Q_TOTAL + q_idx
-    Z = tl.load(Z_local_ptr + z_off)
+    Z = tl.load(Z_local_addr + z_off)
     Z_excl = tl.cumsum(Z, axis=0) - Z
     if HAS_INIT:
-        z_init = tl.load(Z_init_ptr + b * H * Q_TOTAL + h * Q_TOTAL + q_idx)
+        z_init = tl.load(Z_init_addr + b * H * Q_TOTAL + h * Q_TOTAL + q_idx)
         Z_excl = Z_excl + z_init
-    tl.store(Z_prefix_ptr + z_off, Z_excl)
+    tl.store(Z_prefix_addr + z_off, Z_excl)
 
     s_off = (
-        b * H * NC * Q_TOTAL * DV
-        + h * NC * Q_TOTAL * DV
-        + offs_nc[:, None] * Q_TOTAL * DV
-        + q_idx * DV
+        b * H * NC * Q_TOTAL * d_v
+        + h * NC * Q_TOTAL * d_v
+        + offs_nc[:, None] * Q_TOTAL * d_v
+        + q_idx * d_v
         + offs_dv[None, :]
     )
-    S = tl.load(S_local_ptr + s_off)
+    S = tl.load(S_local_addr + s_off)
     S_excl = tl.cumsum(S, axis=0) - S
     if HAS_INIT:
-        s_init_off = b * H * Q_TOTAL * DV + h * Q_TOTAL * DV + q_idx * DV + offs_dv
-        s_init = tl.load(S_init_ptr + s_init_off)
+        s_init_off = b * H * Q_TOTAL * d_v + h * Q_TOTAL * d_v + q_idx * d_v + offs_dv
+        s_init = tl.load(S_init_addr + s_init_off)
         S_excl = S_excl + s_init[None, :]
-    tl.store(S_prefix_ptr + s_off, S_excl)
+    tl.store(S_prefix_addr + s_off, S_excl)
 
 
 @triton.autotune(configs=_SPD_CONFIGS_SCAN, key=_SPD_KEY)
 @triton.jit
 def spd_chunk_output_kernel(
-    Q_ptr,
-    K_ptr,
-    V_ptr,
-    S_pref_ptr,
-    Z_pref_ptr,
-    O_ptr,
-    D_ptr,
+    Q_addr,
+    K_addr,
+    V_addr,
+    S_pref_addr,
+    Z_pref_addr,
+    O_addr,
+    D_addr,
     H,
     T,
     NC,
@@ -298,13 +300,13 @@ def spd_chunk_output_kernel(
     ME: tl.constexpr,
     E: tl.constexpr,
     M: tl.constexpr,
-    DV: tl.constexpr,
+    d_v: tl.constexpr,
     Q_PER_G: tl.constexpr,
     EPS: tl.constexpr,
 ):
     """Output for one chunk = inter (psi(Q) @ S_prefix) + intra (causal).
     Inner: loop over M groups for the per-group (q.k)^2 contribution; outer
-    loop over DV tiles. Grid: (B*H, NC).
+    loop over d_v tiles. Grid: (B*H, NC).
     """
     pid_bh = tl.program_id(0)
     pid_nc = tl.program_id(1)
@@ -322,12 +324,12 @@ def spd_chunk_output_kernel(
     causal = offs_c[:, None] >= offs_c[None, :]
     A_total = tl.zeros((C, C), dtype=tl.float32)
     Z_inter = tl.zeros((C,), dtype=tl.float32)
-    # Full DV in one tile — head_v typically <= 64 fits comfortably and
+    # Full d_v in one tile — head_v typically <= 64 fits comfortably and
     # avoids per-tile loop overhead.
-    O_inter = tl.zeros((C, DV), dtype=tl.float32)
+    O_inter = tl.zeros((C, d_v), dtype=tl.float32)
 
     # Single M-loop: load Q_g/K_g once, do all per-group work in one pass.
-    offs_dv_full = tl.arange(0, DV)
+    offs_dv_full = tl.arange(0, d_v)
     for m_id in tl.static_range(M):
         qk_g_off = (
             b * T * H * ME
@@ -336,8 +338,8 @@ def spd_chunk_output_kernel(
             + m_id * E
             + offs_e[None, :]
         )
-        Q_g = tl.load(Q_ptr + qk_g_off).to(tl.float32)
-        K_g = tl.load(K_ptr + qk_g_off).to(tl.float32)
+        Q_g = tl.load(Q_addr + qk_g_off).to(tl.float32)
+        K_g = tl.load(K_addr + qk_g_off).to(tl.float32)
 
         A_g = tl.dot(Q_g, tl.trans(K_g), allow_tf32=False)
         A_total += A_g * A_g
@@ -352,46 +354,46 @@ def spd_chunk_output_kernel(
             + m_id * Q_PER_G
             + offs_q_pg
         )
-        Zp_g = tl.load(Z_pref_ptr + Zp_g_off).to(tl.float32)
+        Zp_g = tl.load(Z_pref_addr + Zp_g_off).to(tl.float32)
         Z_inter += tl.sum(Q_flat_g * Zp_g[None, :], axis=1)
 
         Sp_g_off = (
-            b * H * NC * Q_TOTAL * DV
-            + h * NC * Q_TOTAL * DV
-            + pid_nc * Q_TOTAL * DV
-            + (m_id * Q_PER_G + offs_q_pg)[:, None] * DV
+            b * H * NC * Q_TOTAL * d_v
+            + h * NC * Q_TOTAL * d_v
+            + pid_nc * Q_TOTAL * d_v
+            + (m_id * Q_PER_G + offs_q_pg)[:, None] * d_v
             + offs_dv_full[None, :]
         )
-        Sp_g = tl.load(S_pref_ptr + Sp_g_off).to(tl.float32)
+        Sp_g = tl.load(S_pref_addr + Sp_g_off).to(tl.float32)
         O_inter += tl.dot(Q_flat_g, Sp_g, allow_tf32=False)
 
     A_masked = tl.where(causal, A_total, 0.0)
     Z_intra = tl.sum(A_masked, axis=1)
     D = Z_inter + Z_intra + EPS
 
-    v_off = b * T * H * DV + t_idx[:, None] * H * DV + h * DV + offs_dv_full[None, :]
-    V_tile = tl.load(V_ptr + v_off).to(tl.float32)
+    v_off = b * T * H * d_v + t_idx[:, None] * H * d_v + h * d_v + offs_dv_full[None, :]
+    V_tile = tl.load(V_addr + v_off).to(tl.float32)
     O_intra = tl.dot(A_masked, V_tile, allow_tf32=False)
     O = (O_inter + O_intra) / D[:, None]
 
-    tl.store(O_ptr + v_off, O.to(O_ptr.dtype.element_ty))
+    tl.store(O_addr + v_off, O.to(O_addr.dtype.element_ty))
 
     d_off = b * T * H + t_idx * H + h
-    tl.store(D_ptr + d_off, D)
+    tl.store(D_addr + d_off, D)
 
 
 @triton.jit
 def spd_final_state_kernel(
-    S_local_ptr,
-    Z_local_ptr,
-    S_prefix_ptr,
-    Z_prefix_ptr,
-    S_final_ptr,
-    Z_final_ptr,
+    S_local_addr,
+    Z_local_addr,
+    S_prefix_addr,
+    Z_prefix_addr,
+    S_final_addr,
+    Z_final_addr,
     H,
     NC: tl.constexpr,
     Q_TOTAL: tl.constexpr,
-    DV: tl.constexpr,
+    d_v: tl.constexpr,
 ):
     """Final state at end of sequence: prefix at chunk NC-1 + local NC-1."""
     pid_bh = tl.program_id(0)
@@ -399,23 +401,23 @@ def spd_final_state_kernel(
     b = pid_bh // H
     h = pid_bh % H
 
-    offs_dv = tl.arange(0, DV)
+    offs_dv = tl.arange(0, d_v)
     last = NC - 1
 
     z_off = b * H * NC * Q_TOTAL + h * NC * Q_TOTAL + last * Q_TOTAL + q_idx
-    z_final = tl.load(Z_prefix_ptr + z_off) + tl.load(Z_local_ptr + z_off)
-    tl.store(Z_final_ptr + b * H * Q_TOTAL + h * Q_TOTAL + q_idx, z_final)
+    z_final = tl.load(Z_prefix_addr + z_off) + tl.load(Z_local_addr + z_off)
+    tl.store(Z_final_addr + b * H * Q_TOTAL + h * Q_TOTAL + q_idx, z_final)
 
     s_off = (
-        b * H * NC * Q_TOTAL * DV
-        + h * NC * Q_TOTAL * DV
-        + last * Q_TOTAL * DV
-        + q_idx * DV
+        b * H * NC * Q_TOTAL * d_v
+        + h * NC * Q_TOTAL * d_v
+        + last * Q_TOTAL * d_v
+        + q_idx * d_v
         + offs_dv
     )
-    s_final = tl.load(S_prefix_ptr + s_off) + tl.load(S_local_ptr + s_off)
+    s_final = tl.load(S_prefix_addr + s_off) + tl.load(S_local_addr + s_off)
     tl.store(
-        S_final_ptr + b * H * Q_TOTAL * DV + h * Q_TOTAL * DV + q_idx * DV + offs_dv,
+        S_final_addr + b * H * Q_TOTAL * d_v + h * Q_TOTAL * d_v + q_idx * d_v + offs_dv,
         s_final,
     )
 
@@ -435,25 +437,24 @@ def chunk_kata_spd_fwd(
 
     Args:
         q_hat, k_hat: (B, T, H, ME) where ME = num_groups * E_per_group
-        v:            (B, T, H, DV)
+        v:            (B, T, H, d_v)
         num_groups:   M >= 1; head_k must be divisible by M and E = head_k/M >= 16.
-        dv_block:     DV tile size; DV must be divisible.
-        initial_state: optional (S_init, Z_init) of shapes (B, H, M*E^2, DV)
+        dv_block:     d_v tile size; d_v must be divisible.
+        initial_state: optional (S_init, Z_init) of shapes (B, H, M*E^2, d_v)
                        and (B, H, M*E^2).
         output_final_state: if True, also return (S_final, Z_final).
     Returns:
-        o: (B, T, H, DV); D, S_prefix, Z_prefix (saved for backward); final_state
+        o: (B, T, H, d_v); D, S_prefix, Z_prefix (saved for backward); final_state
     """
     q_hat = q_hat.contiguous()
     k_hat = k_hat.contiguous()
     v = v.contiguous()
 
     B, T, H, ME = q_hat.shape
-    DV = v.shape[-1]
-    M = num_groups
-    if ME % M != 0:
-        raise ValueError(f"head_k_dim ME={ME} not divisible by num_groups M={M}")
-    E = ME // M
+    d_v = v.shape[-1]
+    if ME % num_groups != 0:
+        raise ValueError(f"head_k_dim ME={ME} not divisible by num_groups={num_groups}")
+    E = ME // num_groups
     if E < 16:
         raise ValueError(f"E = head_k/M = {E} < 16; raise head_k or lower M")
     C = chunk_size
@@ -468,7 +469,7 @@ def chunk_kata_spd_fwd(
 
     dev = q_hat.device
 
-    S_local = torch.empty(B, H, NC, Q_TOTAL, DV, device=dev, dtype=torch.float32)
+    S_local = torch.empty(B, H, NC, Q_TOTAL, d_v, device=dev, dtype=torch.float32)
     Z_local = torch.empty(B, H, NC, Q_TOTAL, device=dev, dtype=torch.float32)
     S_prefix = torch.empty_like(S_local)
     Z_prefix = torch.empty_like(Z_local)
@@ -487,7 +488,7 @@ def chunk_kata_spd_fwd(
         ME=ME,
         E=E,
         M=M,
-        DV=DV,
+        d_v=d_v,
         Q_PER_G=Q_PER_G,
     )
 
@@ -501,9 +502,11 @@ def chunk_kata_spd_fwd(
         Z_init = torch.empty(0, device=dev, dtype=torch.float32)
         has_init = False
 
-    scan_kernel = (
-        spd_chunk_scan_kernel if scan_mode == "tree" else spd_chunk_scan_linear_kernel
-    )
+    if scan_mode == "tree":
+        scan_kernel = spd_chunk_scan_kernel
+    else:
+        scan_kernel = spd_chunk_scan_linear_kernel
+
     scan_kernel[(B * H, Q_TOTAL)](
         S_local,
         Z_local,
@@ -515,7 +518,7 @@ def chunk_kata_spd_fwd(
         HAS_INIT=has_init,
         NC=NC,
         Q_TOTAL=Q_TOTAL,
-        DV=DV,
+        d_v=d_v,
     )
 
     spd_chunk_output_kernel[(B * H, NC)](
@@ -533,14 +536,14 @@ def chunk_kata_spd_fwd(
         ME=ME,
         E=E,
         M=M,
-        DV=DV,
+        d_v=d_v,
         Q_PER_G=Q_PER_G,
         EPS=eps,
     )
 
     final_state = None
     if output_final_state:
-        S_final = torch.empty(B, H, Q_TOTAL, DV, device=dev, dtype=torch.float32)
+        S_final = torch.empty(B, H, Q_TOTAL, d_v, device=dev, dtype=torch.float32)
         Z_final = torch.empty(B, H, Q_TOTAL, device=dev, dtype=torch.float32)
         spd_final_state_kernel[(B * H, Q_TOTAL)](
             S_local,
@@ -552,7 +555,7 @@ def chunk_kata_spd_fwd(
             H,
             NC,  # type: ignore
             Q_TOTAL,  # type: ignore
-            DV,  # type: ignore
+            d_v,  # type: ignore
         )
         final_state = (S_final, Z_final)
 
@@ -565,17 +568,17 @@ def chunk_kata_spd_fwd(
 
 
 @triton.autotune(
-    configs=_SPD_CONFIGS_DV,
+    configs=_SPD_CONFIGS_d_v,
     key=_SPD_KEY,
     prune_configs_by={"early_config_prune": _spd_dv_prune},
 )
 @triton.jit
 def spd_bwd_chunk_state_kernel(
-    Q_ptr,
-    dN_ptr,
-    dD_ptr,
-    RS_ptr,
-    RZ_ptr,
+    Q_addr,
+    dN_addr,
+    dD_addr,
+    RS_addr,
+    RZ_addr,
     H,
     T,
     NC,
@@ -583,9 +586,9 @@ def spd_bwd_chunk_state_kernel(
     ME: tl.constexpr,
     E: tl.constexpr,
     M: tl.constexpr,
-    DV: tl.constexpr,
+    d_v: tl.constexpr,
     Q_PER_G: tl.constexpr,
-    DV_BLK: tl.constexpr,
+    d_v_BLK: tl.constexpr,
 ):
     """Reverse-state local: RS_g = Q_outer_g^T @ dN, RZ_g = Q_outer_g^T @ dD.
     Same loop structure as fwd state with (q, dN, dD) instead of (k, v, 1).
@@ -603,7 +606,7 @@ def spd_bwd_chunk_state_kernel(
     Q_TOTAL: tl.constexpr = M * Q_PER_G
 
     dd_off = b * T * H + t_idx * H + h
-    dD = tl.load(dD_ptr + dd_off).to(tl.float32)  # (C,)
+    dD = tl.load(dD_addr + dd_off).to(tl.float32)  # (C,)
 
     for m_id in tl.static_range(M):
         Q_off = (
@@ -613,7 +616,7 @@ def spd_bwd_chunk_state_kernel(
             + m_id * E
             + offs_e[None, :]
         )
-        Q_g = tl.load(Q_ptr + Q_off).to(tl.float32)  # (C, E)
+        Q_g = tl.load(Q_addr + Q_off).to(tl.float32)  # (C, E)
 
         Q_outer = Q_g[:, :, None] * Q_g[:, None, :]
         Q_flat = tl.reshape(Q_outer, (C, Q_PER_G))  # (C, Q_PER_G)
@@ -627,38 +630,38 @@ def spd_bwd_chunk_state_kernel(
             + m_id * Q_PER_G
             + offs_q_pg
         )
-        tl.store(RZ_ptr + rz_off, RZ_g)
+        tl.store(RZ_addr + rz_off, RZ_g)
 
-        # RS DV-tiled
-        for dv_id in tl.static_range(DV // DV_BLK):
-            offs_dv = dv_id * DV_BLK + tl.arange(0, DV_BLK)
+        # RS d_v-tiled
+        for dv_id in tl.static_range(d_v // d_v_BLK):
+            offs_dv = dv_id * d_v_BLK + tl.arange(0, d_v_BLK)
             dn_off = (
-                b * T * H * DV + t_idx[:, None] * H * DV + h * DV + offs_dv[None, :]
+                b * T * H * d_v + t_idx[:, None] * H * d_v + h * d_v + offs_dv[None, :]
             )
-            dN_tile = tl.load(dN_ptr + dn_off).to(tl.float32)  # (C, DV_BLK)
+            dN_tile = tl.load(dN_addr + dn_off).to(tl.float32)  # (C, d_v_BLK)
             RS_tile = tl.dot(tl.trans(Q_flat), dN_tile, allow_tf32=False)
 
             rs_off = (
-                b * H * NC * Q_TOTAL * DV
-                + h * NC * Q_TOTAL * DV
-                + pid_nc * Q_TOTAL * DV
-                + (m_id * Q_PER_G + offs_q_pg)[:, None] * DV
+                b * H * NC * Q_TOTAL * d_v
+                + h * NC * Q_TOTAL * d_v
+                + pid_nc * Q_TOTAL * d_v
+                + (m_id * Q_PER_G + offs_q_pg)[:, None] * d_v
                 + offs_dv[None, :]
             )
-            tl.store(RS_ptr + rs_off, RS_tile)
+            tl.store(RS_addr + rs_off, RS_tile)
 
 
 @triton.autotune(configs=_SPD_CONFIGS_SCAN, key=_SPD_KEY_SCAN)
 @triton.jit
 def spd_bwd_chunk_scan_kernel(
-    RS_local_ptr,
-    RZ_local_ptr,
-    RS_suffix_ptr,
-    RZ_suffix_ptr,
+    RS_local_addr,
+    RZ_local_addr,
+    RS_suffix_addr,
+    RZ_suffix_addr,
     H,
     NC: tl.constexpr,
     Q_TOTAL: tl.constexpr,
-    DV: tl.constexpr,
+    d_v: tl.constexpr,
 ):
     """Reverse exclusive cumsum along NC. Grid: (B*H, Q_TOTAL)."""
     pid_bh = tl.program_id(0)
@@ -668,40 +671,40 @@ def spd_bwd_chunk_scan_kernel(
 
     offs_nc = tl.arange(0, NC)
     rev_nc = NC - 1 - offs_nc
-    offs_dv = tl.arange(0, DV)
+    offs_dv = tl.arange(0, d_v)
 
     z_off = b * H * NC * Q_TOTAL + h * NC * Q_TOTAL + rev_nc * Q_TOTAL + q_idx
-    Z = tl.load(RZ_local_ptr + z_off)
+    Z = tl.load(RZ_local_addr + z_off)
     Z_cum = tl.cumsum(Z, axis=0)
-    tl.store(RZ_suffix_ptr + z_off, Z_cum - Z)
+    tl.store(RZ_suffix_addr + z_off, Z_cum - Z)
 
     s_off = (
-        b * H * NC * Q_TOTAL * DV
-        + h * NC * Q_TOTAL * DV
-        + rev_nc[:, None] * Q_TOTAL * DV
-        + q_idx * DV
+        b * H * NC * Q_TOTAL * d_v
+        + h * NC * Q_TOTAL * d_v
+        + rev_nc[:, None] * Q_TOTAL * d_v
+        + q_idx * d_v
         + offs_dv[None, :]
     )
-    S = tl.load(RS_local_ptr + s_off)
+    S = tl.load(RS_local_addr + s_off)
     S_cum = tl.cumsum(S, axis=0)
-    tl.store(RS_suffix_ptr + s_off, S_cum - S)
+    tl.store(RS_suffix_addr + s_off, S_cum - S)
 
 
 @triton.autotune(
-    configs=_SPD_CONFIGS_DV,
+    configs=_SPD_CONFIGS_d_v,
     key=_SPD_KEY,
     prune_configs_by={"early_config_prune": _spd_dv_prune},
 )
 @triton.jit
 def spd_bwd_chunk_output_dq_kernel(
-    Q_ptr,
-    K_ptr,
-    V_ptr,
-    dN_ptr,
-    dD_ptr,
-    S_pref_ptr,
-    Z_pref_ptr,
-    dQ_ptr,
+    Q_addr,
+    K_addr,
+    V_addr,
+    dN_addr,
+    dD_addr,
+    S_pref_addr,
+    Z_pref_addr,
+    dQ_addr,
     H,
     T,
     NC,
@@ -709,9 +712,9 @@ def spd_bwd_chunk_output_dq_kernel(
     ME: tl.constexpr,
     E: tl.constexpr,
     M: tl.constexpr,
-    DV: tl.constexpr,
+    d_v: tl.constexpr,
     Q_PER_G: tl.constexpr,
-    DV_BLK: tl.constexpr,
+    d_v_BLK: tl.constexpr,
 ):
     """dq for one chunk (M-aware). Inter via fwd states + intra causal.
 
@@ -735,17 +738,17 @@ def spd_bwd_chunk_output_dq_kernel(
     causal = offs_c[:, None] >= offs_c[None, :]
 
     dd_off = b * T * H + t_idx * H + h
-    dD = tl.load(dD_ptr + dd_off).to(tl.float32)  # (C,)
+    dD = tl.load(dD_addr + dd_off).to(tl.float32)  # (C,)
 
     # dN_v: (C, C). Computed once per (chunk, group) — but actually dN_v
-    # depends on V which is same for all groups. We compute once by tiling DV.
+    # depends on V which is same for all groups. We compute once by tiling d_v.
     dN_v = tl.zeros((C, C), dtype=tl.float32)
-    for dv_id in tl.static_range(DV // DV_BLK):
-        offs_dv = dv_id * DV_BLK + tl.arange(0, DV_BLK)
-        v_off = b * T * H * DV + t_idx[:, None] * H * DV + h * DV + offs_dv[None, :]
-        V_tile = tl.load(V_ptr + v_off).to(tl.float32)
+    for dv_id in tl.static_range(d_v // d_v_BLK):
+        offs_dv = dv_id * d_v_BLK + tl.arange(0, d_v_BLK)
+        v_off = b * T * H * d_v + t_idx[:, None] * H * d_v + h * d_v + offs_dv[None, :]
+        V_tile = tl.load(V_addr + v_off).to(tl.float32)
         dN_off = v_off
-        dN_tile = tl.load(dN_ptr + dN_off).to(tl.float32)
+        dN_tile = tl.load(dN_addr + dN_off).to(tl.float32)
         dN_v += tl.dot(dN_tile, tl.trans(V_tile), allow_tf32=False)
 
     for m_id in tl.static_range(M):
@@ -757,8 +760,8 @@ def spd_bwd_chunk_output_dq_kernel(
             + m_id * E
             + offs_e[None, :]
         )
-        Q_g = tl.load(Q_ptr + qk_g_off).to(tl.float32)
-        K_g = tl.load(K_ptr + qk_g_off).to(tl.float32)
+        Q_g = tl.load(Q_addr + qk_g_off).to(tl.float32)
+        K_g = tl.load(K_addr + qk_g_off).to(tl.float32)
 
         # ---- Intra dq_g ----
         A_g = tl.dot(Q_g, tl.trans(K_g), allow_tf32=False)  # (C, C)
@@ -767,24 +770,24 @@ def spd_bwd_chunk_output_dq_kernel(
         dq_intra_g = 2.0 * tl.dot(beta_c, K_g, allow_tf32=False)  # (C, E)
 
         # ---- Inter dq_g ----
-        # M_pre[c, ij] = sum_d dN[c, d] Sp_g[ij, d]; tile DV
+        # M_pre[c, ij] = sum_d dN[c, d] Sp_g[ij, d]; tile d_v
         M_pre = tl.zeros((C, Q_PER_G), dtype=tl.float32)
-        for dv_id in tl.static_range(DV // DV_BLK):
-            offs_dv = dv_id * DV_BLK + tl.arange(0, DV_BLK)
+        for dv_id in tl.static_range(d_v // d_v_BLK):
+            offs_dv = dv_id * d_v_BLK + tl.arange(0, d_v_BLK)
             dn_off = (
-                b * T * H * DV + t_idx[:, None] * H * DV + h * DV + offs_dv[None, :]
+                b * T * H * d_v + t_idx[:, None] * H * d_v + h * d_v + offs_dv[None, :]
             )
-            dN_tile = tl.load(dN_ptr + dn_off).to(tl.float32)  # (C, DV_BLK)
+            dN_tile = tl.load(dN_addr + dn_off).to(tl.float32)  # (C, d_v_BLK)
             sp_g_off = (
-                b * H * NC * Q_TOTAL * DV
-                + h * NC * Q_TOTAL * DV
-                + pid_nc * Q_TOTAL * DV
-                + (m_id * Q_PER_G + offs_q_pg)[:, None] * DV
+                b * H * NC * Q_TOTAL * d_v
+                + h * NC * Q_TOTAL * d_v
+                + pid_nc * Q_TOTAL * d_v
+                + (m_id * Q_PER_G + offs_q_pg)[:, None] * d_v
                 + offs_dv[None, :]
             )
-            Sp_g_tile = tl.load(S_pref_ptr + sp_g_off).to(
+            Sp_g_tile = tl.load(S_pref_addr + sp_g_off).to(
                 tl.float32
-            )  # (Q_PER_G, DV_BLK)
+            )  # (Q_PER_G, d_v_BLK)
             M_pre += tl.dot(dN_tile, tl.trans(Sp_g_tile), allow_tf32=False)
 
         M_3d = tl.reshape(M_pre, (C, E, E))
@@ -798,7 +801,7 @@ def spd_bwd_chunk_output_dq_kernel(
             + m_id * Q_PER_G
             + offs_q_pg
         )
-        Zp_g = tl.load(Z_pref_ptr + zp_g_off).to(tl.float32)
+        Zp_g = tl.load(Z_pref_addr + zp_g_off).to(tl.float32)
         Z_3d = tl.reshape(Zp_g, (E, E))
         QZ_g = tl.dot(Q_g, Z_3d, allow_tf32=False)
         dq_inter_D_g = 2.0 * dD[:, None] * QZ_g
@@ -812,35 +815,35 @@ def spd_bwd_chunk_output_dq_kernel(
             + m_id * E
             + offs_e[None, :]
         )
-        tl.store(dQ_ptr + dq_g_off, dq_g.to(dQ_ptr.dtype.element_ty))
+        tl.store(dQ_addr + dq_g_off, dq_g.to(dQ_addr.dtype.element_ty))
 
 
 @triton.autotune(
-    configs=_SPD_CONFIGS_DV,
+    configs=_SPD_CONFIGS_d_v,
     key=_SPD_KEY,
     prune_configs_by={"early_config_prune": _spd_dv_prune},
 )
 @triton.jit
 def spd_bwd_chunk_output_dkdv_kernel(
-    Q_ptr,
-    K_ptr,
-    V_ptr,
-    dN_ptr,
-    dD_ptr,
-    RS_suff_ptr,
-    RZ_suff_ptr,
-    dK_ptr,
-    dV_ptr,
+    q_addr,
+    k_addr,
+    v_addr,
+    dN_addr,
+    dD_addr,
+    RS_suff_addr,
+    RZ_suff_addr,
+    dK_addr,
+    dV_addr,
     H,
     T,
-    NC,
-    C: tl.constexpr,
+    num_chunks,
+    chunk_size: tl.constexpr,
     ME: tl.constexpr,
     E: tl.constexpr,
-    M: tl.constexpr,
-    DV: tl.constexpr,
+    num_groups: tl.constexpr,
+    d_v: tl.constexpr,
     Q_PER_G: tl.constexpr,
-    DV_BLK: tl.constexpr,
+    d_v_BLK: tl.constexpr,
 ):
     """dk and dv for one chunk (M-aware). Inter via reverse states + intra anti-causal.
 
@@ -853,29 +856,29 @@ def spd_bwd_chunk_output_dkdv_kernel(
     b = pid_bh // H
     h = pid_bh % H
 
-    offs_c = tl.arange(0, C)
+    offs_c = tl.arange(0, chunk_size)
     offs_e = tl.arange(0, E)
     offs_q_pg = tl.arange(0, Q_PER_G)
-    t_idx = pid_nc * C + offs_c
-    Q_TOTAL: tl.constexpr = M * Q_PER_G
+    t_idx = pid_nc * chunk_size + offs_c
+    Q_TOTAL: tl.constexpr = num_groups * Q_PER_G
 
     causal = offs_c[:, None] >= offs_c[None, :]
 
     dd_off = b * T * H + t_idx * H + h
-    dD = tl.load(dD_ptr + dd_off).to(tl.float32)
+    dD = tl.load(dD_addr + dd_off).to(tl.float32)
 
     # dN_v (C, C) — same as in dq kernel
-    dN_v = tl.zeros((C, C), dtype=tl.float32)
-    for dv_id in tl.static_range(DV // DV_BLK):
-        offs_dv = dv_id * DV_BLK + tl.arange(0, DV_BLK)
-        v_off = b * T * H * DV + t_idx[:, None] * H * DV + h * DV + offs_dv[None, :]
-        V_tile = tl.load(V_ptr + v_off).to(tl.float32)
-        dN_tile = tl.load(dN_ptr + v_off).to(tl.float32)
+    dN_v = tl.zeros((chunk_size, chunk_size), dtype=tl.float32)
+    for dv_id in tl.static_range(d_v // d_v_BLK):
+        offs_dv = dv_id * d_v_BLK + tl.arange(0, d_v_BLK)
+        v_off = b * T * H * d_v + t_idx[:, None] * H * d_v + h * d_v + offs_dv[None, :]
+        V_tile = tl.load(v_addr + v_off).to(tl.float32)
+        dN_tile = tl.load(dN_addr + v_off).to(tl.float32)
         dN_v += tl.dot(dN_tile, tl.trans(V_tile), allow_tf32=False)
 
     # A_total = sum_g (q_g . k_g)^2 (for dv intra)
-    A_total = tl.zeros((C, C), dtype=tl.float32)
-    for m_id in tl.static_range(M):
+    A_total = tl.zeros((chunk_size, chunk_size), dtype=tl.float32)
+    for m_id in tl.static_range(num_groups):
         qk_g_off = (
             b * T * H * ME
             + t_idx[:, None] * H * ME
@@ -883,24 +886,24 @@ def spd_bwd_chunk_output_dkdv_kernel(
             + m_id * E
             + offs_e[None, :]
         )
-        Q_g = tl.load(Q_ptr + qk_g_off).to(tl.float32)
-        K_g = tl.load(K_ptr + qk_g_off).to(tl.float32)
+        Q_g = tl.load(q_addr + qk_g_off).to(tl.float32)
+        K_g = tl.load(k_addr + qk_g_off).to(tl.float32)
         A_g = tl.dot(Q_g, tl.trans(K_g), allow_tf32=False)
         A_total += A_g * A_g
     A_total_c = tl.where(causal, A_total, 0.0)  # (C, C)
 
-    # ----- dv = inter + intra (DV tiled) -----
-    for dv_id in tl.static_range(DV // DV_BLK):
-        offs_dv = dv_id * DV_BLK + tl.arange(0, DV_BLK)
-        v_off = b * T * H * DV + t_idx[:, None] * H * DV + h * DV + offs_dv[None, :]
-        dN_tile = tl.load(dN_ptr + v_off).to(tl.float32)  # (C, DV_BLK)
+    # ----- dv = inter + intra (d_v tiled) -----
+    for dv_id in tl.static_range(d_v // d_v_BLK):
+        offs_dv = dv_id * d_v_BLK + tl.arange(0, d_v_BLK)
+        v_off = b * T * H * d_v + t_idx[:, None] * H * d_v + h * d_v + offs_dv[None, :]
+        dN_tile = tl.load(dN_addr + v_off).to(tl.float32)  # (C, d_v_BLK)
 
-        # dv_intra_tile = A_total_c^T @ dN_tile  (C, DV_BLK)
+        # dv_intra_tile = A_total_c^T @ dN_tile  (C, d_v_BLK)
         dv_intra_tile = tl.dot(tl.trans(A_total_c), dN_tile, allow_tf32=False)
 
         # dv_inter_tile: per-group
-        dv_inter_tile = tl.zeros((C, DV_BLK), dtype=tl.float32)
-        for m_id in tl.static_range(M):
+        dv_inter_tile = tl.zeros((chunk_size, d_v_BLK), dtype=tl.float32)
+        for m_id in tl.static_range(num_groups):
             k_g_off = (
                 b * T * H * ME
                 + t_idx[:, None] * H * ME
@@ -908,24 +911,24 @@ def spd_bwd_chunk_output_dkdv_kernel(
                 + m_id * E
                 + offs_e[None, :]
             )
-            K_g = tl.load(K_ptr + k_g_off).to(tl.float32)
+            K_g = tl.load(k_addr + k_g_off).to(tl.float32)
             K_outer = K_g[:, :, None] * K_g[:, None, :]
-            K_flat = tl.reshape(K_outer, (C, Q_PER_G))
+            K_flat = tl.reshape(K_outer, (chunk_size, Q_PER_G))
             rs_g_off = (
-                b * H * NC * Q_TOTAL * DV
-                + h * NC * Q_TOTAL * DV
-                + pid_nc * Q_TOTAL * DV
-                + (m_id * Q_PER_G + offs_q_pg)[:, None] * DV
+                b * H * num_chunks * Q_TOTAL * d_v
+                + h * num_chunks * Q_TOTAL * d_v
+                + pid_nc * Q_TOTAL * d_v
+                + (m_id * Q_PER_G + offs_q_pg)[:, None] * d_v
                 + offs_dv[None, :]
             )
-            RS_g_tile = tl.load(RS_suff_ptr + rs_g_off).to(tl.float32)
+            RS_g_tile = tl.load(RS_suff_addr + rs_g_off).to(tl.float32)
             dv_inter_tile += tl.dot(K_flat, RS_g_tile, allow_tf32=False)
 
         dv_tile = dv_inter_tile + dv_intra_tile
-        tl.store(dV_ptr + v_off, dv_tile.to(dV_ptr.dtype.element_ty))
+        tl.store(dV_addr + v_off, dv_tile.to(dV_addr.dtype.element_ty))
 
     # ----- dk per group -----
-    for m_id in tl.static_range(M):
+    for m_id in tl.static_range(num_groups):
         qk_g_off = (
             b * T * H * ME
             + t_idx[:, None] * H * ME
@@ -933,8 +936,8 @@ def spd_bwd_chunk_output_dkdv_kernel(
             + m_id * E
             + offs_e[None, :]
         )
-        Q_g = tl.load(Q_ptr + qk_g_off).to(tl.float32)
-        K_g = tl.load(K_ptr + qk_g_off).to(tl.float32)
+        Q_g = tl.load(q_addr + qk_g_off).to(tl.float32)
+        K_g = tl.load(k_addr + qk_g_off).to(tl.float32)
 
         # ---- Intra dk_g ----
         A_g = tl.dot(Q_g, tl.trans(K_g), allow_tf32=False)
@@ -944,39 +947,41 @@ def spd_bwd_chunk_output_dkdv_kernel(
 
         # ---- Inter dk_g ----
         # dk_inter_N_g: 2 sum_i K_g[m,i] sum_d v[m,d] RS_g[l, i, d]
-        # Compute U_g[m, q] = sum_d V_tile[m, d] RS_g[q, d]; tile DV
-        U_g = tl.zeros((C, Q_PER_G), dtype=tl.float32)
-        for dv_id in tl.static_range(DV // DV_BLK):
-            offs_dv = dv_id * DV_BLK + tl.arange(0, DV_BLK)
-            v_off = b * T * H * DV + t_idx[:, None] * H * DV + h * DV + offs_dv[None, :]
-            V_tile = tl.load(V_ptr + v_off).to(tl.float32)
+        # Compute U_g[m, q] = sum_d V_tile[m, d] RS_g[q, d]; tile d_v
+        U_g = tl.zeros((chunk_size, Q_PER_G), dtype=tl.float32)
+        for dv_id in tl.static_range(d_v // d_v_BLK):
+            offs_dv = dv_id * d_v_BLK + tl.arange(0, d_v_BLK)
+            v_off = (
+                b * T * H * d_v + t_idx[:, None] * H * d_v + h * d_v + offs_dv[None, :]
+            )
+            V_tile = tl.load(v_addr + v_off).to(tl.float32)
             rs_g_off = (
-                b * H * NC * Q_TOTAL * DV
-                + h * NC * Q_TOTAL * DV
-                + pid_nc * Q_TOTAL * DV
-                + (m_id * Q_PER_G + offs_q_pg)[:, None] * DV
+                b * H * num_chunks * Q_TOTAL * d_v
+                + h * num_chunks * Q_TOTAL * d_v
+                + pid_nc * Q_TOTAL * d_v
+                + (m_id * Q_PER_G + offs_q_pg)[:, None] * d_v
                 + offs_dv[None, :]
             )
-            RS_g_tile = tl.load(RS_suff_ptr + rs_g_off).to(tl.float32)
+            RS_g_tile = tl.load(RS_suff_addr + rs_g_off).to(tl.float32)
             U_g += tl.dot(V_tile, tl.trans(RS_g_tile), allow_tf32=False)
-        U_3d = tl.reshape(U_g, (C, E, E))
+        U_3d = tl.reshape(U_g, (chunk_size, E, E))
         dk_inter_N_g = 2.0 * tl.sum(K_g[:, None, :] * U_3d, axis=2)  # (C, E)
 
         # dk_inter_D_g: 2 sum_i K_g[m,i] RZ_g[i, l]
         rz_g_off = (
-            b * H * NC * Q_TOTAL
-            + h * NC * Q_TOTAL
+            b * H * num_chunks * Q_TOTAL
+            + h * num_chunks * Q_TOTAL
             + pid_nc * Q_TOTAL
             + m_id * Q_PER_G
             + offs_q_pg
         )
-        RZ_g = tl.load(RZ_suff_ptr + rz_g_off).to(tl.float32)
+        RZ_g = tl.load(RZ_suff_addr + rz_g_off).to(tl.float32)
         RZ_3d = tl.reshape(RZ_g, (E, E))
         dk_inter_D_g = 2.0 * tl.dot(K_g, RZ_3d, allow_tf32=False)
 
         dk_g = dk_intra_g + dk_inter_N_g + dk_inter_D_g
         dk_g_off = qk_g_off
-        tl.store(dK_ptr + dk_g_off, dk_g.to(dK_ptr.dtype.element_ty))
+        tl.store(dK_addr + dk_g_off, dk_g.to(dK_addr.dtype.element_ty))
 
 
 def chunk_kata_spd_bwd(
@@ -992,7 +997,7 @@ def chunk_kata_spd_bwd(
     num_groups: int = 1,
 ):
     B, T, H, ME = q_hat.shape
-    DV = v.shape[-1]
+    d_v = v.shape[-1]
     M = num_groups
     E = ME // M
     Q_PER_G = E * E
@@ -1005,7 +1010,7 @@ def chunk_kata_spd_bwd(
     dN = (do.float() / Df.unsqueeze(-1)).contiguous()
     dD = (-(do.float() * o.float()).sum(dim=-1) / Df).contiguous()
 
-    RS_local = torch.empty(B, H, NC, Q_TOTAL, DV, device=dev, dtype=torch.float32)
+    RS_local = torch.empty(B, H, NC, Q_TOTAL, d_v, device=dev, dtype=torch.float32)
     RZ_local = torch.empty(B, H, NC, Q_TOTAL, device=dev, dtype=torch.float32)
     RS_suffix = torch.empty_like(RS_local)
     RZ_suffix = torch.empty_like(RZ_local)
@@ -1027,7 +1032,7 @@ def chunk_kata_spd_bwd(
         ME=ME,
         E=E,
         M=M,
-        DV=DV,
+        d_v=d_v,
         Q_PER_G=Q_PER_G,
     )
 
@@ -1039,7 +1044,7 @@ def chunk_kata_spd_bwd(
         H,
         NC=NC,
         Q_TOTAL=Q_TOTAL,
-        DV=DV,
+        d_v=d_v,
     )
 
     spd_bwd_chunk_output_dq_kernel[(B * H, NC)](
@@ -1058,7 +1063,7 @@ def chunk_kata_spd_bwd(
         ME=ME,
         E=E,
         M=M,
-        DV=DV,
+        d_v=d_v,
         Q_PER_G=Q_PER_G,
     )
 
@@ -1079,7 +1084,7 @@ def chunk_kata_spd_bwd(
         ME=ME,
         E=E,
         M=M,
-        DV=DV,
+        d_v=d_v,
         Q_PER_G=Q_PER_G,
     )
 
@@ -1136,7 +1141,7 @@ def chunk_kata_spd(
     initial_state=None,
     output_final_state: bool = False,
 ):
-    """Chunked SPD linear attention. Block sizes (DV_BLK, num_warps,
+    """Chunked SPD linear attention. Block sizes (d_v_BLK, num_warps,
     num_stages) are picked by triton.autotune at first call per shape."""
     if initial_state is not None or output_final_state:
         O, _, _, _, final = chunk_kata_spd_fwd(
@@ -1169,7 +1174,6 @@ def kata_spd_recurrent_step(
     E = ME // M
     Q_PER_G = E * E
     Q_TOTAL = M * Q_PER_G
-    DV = v_new.shape[-1]
 
     qf = q_new.float().reshape(B, H, M, E)
     kf = k_new.float().reshape(B, H, M, E)
@@ -1178,7 +1182,7 @@ def kata_spd_recurrent_step(
     kk = (kf.unsqueeze(-1) * kf.unsqueeze(-2)).reshape(B, H, Q_TOTAL)  # (B, H, M*E^2)
     qq = (qf.unsqueeze(-1) * qf.unsqueeze(-2)).reshape(B, H, Q_TOTAL)
 
-    state_S = state_S + kk.unsqueeze(-1) * vf.unsqueeze(-2)  # (B, H, Q_TOTAL, DV)
+    state_S = state_S + kk.unsqueeze(-1) * vf.unsqueeze(-2)  # (B, H, Q_TOTAL, d_v)
     state_Z = state_Z + kk
 
     N = (qq.unsqueeze(-1) * state_S).sum(dim=-2)

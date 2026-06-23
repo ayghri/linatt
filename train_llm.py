@@ -145,18 +145,14 @@ class DDPLLMPretrainer:
             elif self.is_main():
                 print(f"resume='{resume}' not found -- starting fresh.")
 
-        self.wandb_id = None
         if self.is_main():
-            run = wandb.init(
+            wandb.init(
                 project=cfg.wandb.project,
                 entity=cfg.wandb.entity,
                 mode=cfg.wandb.mode,
                 name=cfg.run_name,
                 config=OmegaConf.to_container(cfg, resolve=True),
             )
-            # stash the run id so eval_ckpt.py can append eval/* to the SAME run.
-            if cfg.wandb.mode != "disabled":
-                self.wandb_id = getattr(run, "id", None)
             print(
                 f"batch_size/GPU={self.batch_size}  max_steps={self.max_steps}  "
                 f"warmup_steps={self.warmup_steps}  tokens/step={self.tokens_per_step}"
@@ -174,11 +170,6 @@ class DDPLLMPretrainer:
             "model": self.model.module.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "tokens_seen": step * self.tokens_per_step,
-            # self-contained for eval: rebuild the exact model + tokenizer,
-            # and the W&B run id so eval logs into the same run.
-            "hf_kwargs": OmegaConf.to_container(self.cfg.model.hf_kwargs, resolve=True),
-            "tokenizer": self.cfg.data.tokenizer,
-            "wandb_run_id": self.wandb_id,
             "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state(),
             "numpy_rng": np.random.get_state(),
