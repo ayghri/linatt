@@ -24,14 +24,54 @@ def apply() -> None:
     if _APPLIED:
         return
 
-    from fla.models.mamba2.modeling_mamba2 import Mamba2ForCausalLM
-    if list(getattr(Mamba2ForCausalLM, '_tied_weights_keys', [])) != ['lm_head.weight']:
-        Mamba2ForCausalLM._tied_weights_keys = ['lm_head.weight']
-
+    _register_kata()            # import kata so its CausalLM class exists to patch
+    _patch_tied_weights_keys()  # version-aware: list (tf<5) vs dict (tf>=5)
     _patch_fla_attn_to_sdpa_flash()
-    _register_kata()
 
     _APPLIED = True
+
+
+def _patch_tied_weights_keys() -> None:
+    """Make fla's tied-embedding bookkeeping work across transformers versions.
+
+    transformers >= 5.0 expects `_tied_weights_keys` to be a **dict**
+    `{tied_param: source_param}` (e.g. {"lm_head.weight": "model.embeddings.weight"})
+    and calls `.keys()`/`.values()` on it in `PreTrainedModel.post_init` ->
+    `get_expanded_tied_weights_keys`. fla still ships the old **list** form
+    (`["lm_head.weight"]`), which raises `AttributeError: 'list' object has no
+    attribute 'keys'` when building any tied-embedding fla model. Convert it.
+
+    On transformers < 5 the list form is still required (and upstream mamba2 ships
+    an empty list that breaks safetensors save), so we keep the list there.
+    """
+    import transformers
+    from fla.models.mamba2.modeling_mamba2 import Mamba2ForCausalLM
+
+    major = int(transformers.__version__.split(".")[0])
+    if major < 5:
+        if list(getattr(Mamba2ForCausalLM, "_tied_weights_keys", []) or []) != ["lm_head.weight"]:
+            Mamba2ForCausalLM._tied_weights_keys = ["lm_head.weight"]
+        return
+
+    # transformers >= 5: dict {tied_param -> source (input embedding) param}.
+    # Source path differs by base-model attr: most fla models use
+    # self.model.embeddings; mamba2 uses self.backbone.embeddings.
+    from fla.models.transformer.modeling_transformer import TransformerForCausalLM
+    from fla.models.gated_deltanet.modeling_gated_deltanet import GatedDeltaNetForCausalLM
+    from fla.models.delta_net.modeling_delta_net import DeltaNetForCausalLM
+    specs = [
+        (TransformerForCausalLM, "model.embeddings.weight"),
+        (GatedDeltaNetForCausalLM, "model.embeddings.weight"),
+        (DeltaNetForCausalLM, "model.embeddings.weight"),
+        (Mamba2ForCausalLM, "backbone.embeddings.weight"),
+    ]
+    try:
+        from kata.modeling import KataForCausalLM
+        specs.append((KataForCausalLM, "model.embeddings.weight"))
+    except Exception:
+        pass
+    for cls, source in specs:
+        cls._tied_weights_keys = {"lm_head.weight": source}
 
 
 def _register_kata() -> None:
