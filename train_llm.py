@@ -11,10 +11,12 @@ Launch (CUDA_HOME needed for fla's tilelang GDN backward):
 import glob
 import math
 import os
+import random
 import time
 from contextlib import nullcontext
 
 import hydra
+import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
@@ -132,14 +134,29 @@ class DDPLLMPretrainer:
             min_lr_rate=float(tr.min_lr_rate),
         )
 
+        # ---- resume (optional): null | "latest" | path/to/step_N.pt ----
+        self.start_step = 0
+        resume = tr.get("resume", None)
+        if resume:
+            if resume == "latest":
+                resume = os.path.join(self.save_dir, "latest.pt")
+            if os.path.exists(resume):
+                self.load_checkpoint(resume)  # sets self.start_step
+            elif self.is_main():
+                print(f"resume='{resume}' not found -- starting fresh.")
+
+        self.wandb_id = None
         if self.is_main():
-            wandb.init(
+            run = wandb.init(
                 project=cfg.wandb.project,
                 entity=cfg.wandb.entity,
                 mode=cfg.wandb.mode,
                 name=cfg.run_name,
                 config=OmegaConf.to_container(cfg, resolve=True),
             )
+            # stash the run id so eval_ckpt.py can append eval/* to the SAME run.
+            if cfg.wandb.mode != "disabled":
+                self.wandb_id = getattr(run, "id", None)
             print(
                 f"batch_size/GPU={self.batch_size}  max_steps={self.max_steps}  "
                 f"warmup_steps={self.warmup_steps}  tokens/step={self.tokens_per_step}"
@@ -152,14 +169,38 @@ class DDPLLMPretrainer:
         if not self.is_main():
             return
         os.makedirs(self.save_dir, exist_ok=True)
-        torch.save(
-            {
-                "step": step,
-                "model": self.model.module.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-            },
-            os.path.join(self.save_dir, f"step_{step}.pt"),
-        )
+        ckpt = {
+            "step": step,
+            "model": self.model.module.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "tokens_seen": step * self.tokens_per_step,
+            # self-contained for eval: rebuild the exact model + tokenizer,
+            # and the W&B run id so eval logs into the same run.
+            "hf_kwargs": OmegaConf.to_container(self.cfg.model.hf_kwargs, resolve=True),
+            "tokenizer": self.cfg.data.tokenizer,
+            "wandb_run_id": self.wandb_id,
+            "torch_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state(),
+            "numpy_rng": np.random.get_state(),
+            "python_rng": random.getstate(),
+        }
+        torch.save(ckpt, os.path.join(self.save_dir, f"step_{step}.pt"))
+        # stable name so `resume=latest` always finds the newest state.
+        torch.save(ckpt, os.path.join(self.save_dir, "latest.pt"))
+
+    def load_checkpoint(self, path):
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        self.model.module.load_state_dict(ckpt["model"])
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        torch.set_rng_state(ckpt["torch_rng"].cpu())
+        torch.cuda.set_rng_state(ckpt["cuda_rng"].cpu())
+        np.random.set_state(ckpt["numpy_rng"])
+        random.setstate(ckpt["python_rng"])
+        self.start_step = int(ckpt["step"])
+        self.scheduler.update(self.start_step)  # restore lr for the resume step
+        if self.is_main():
+            print(f"resumed from {path} at step {self.start_step} "
+                  f"({ckpt.get('tokens_seen', 0)/1e9:.2f}B tokens)")
 
     def train(self):
         self.model.train()
@@ -168,11 +209,23 @@ class DDPLLMPretrainer:
             f"{len(self.dataloader) // self.grad_accum} available"
         )
 
-        pbar = tqdm(range(self.max_steps), disable=not self.is_main())
+        # Single pass with a fixed epoch -> deterministic order, so skipping
+        # start_step*grad_accum microbatches resumes at the exact data position.
+        self.sampler.set_epoch(0)
         loader = iter(self.dataloader)
-        t_last = time.perf_counter()
+        if self.start_step > 0:
+            for _ in tqdm(range(self.start_step * self.grad_accum),
+                          desc="skip seen data", disable=not self.is_main()):
+                next(loader)
 
-        self.save_checkpoint(0)  # sanity: checkpoint the random init at step 0
+        pbar = tqdm(range(self.start_step, self.max_steps),
+                    initial=self.start_step, total=self.max_steps,
+                    disable=not self.is_main())
+
+        if self.start_step == 0:
+            self.save_checkpoint(0)  # sanity: checkpoint the random init at step 0
+
+        t_last = time.perf_counter()  # start the throughput clock AFTER the init save
 
         for step in pbar:
             self.optimizer.zero_grad()
@@ -236,6 +289,7 @@ class DDPLLMPretrainer:
 
             if (step + 1) % self.checkpoint_interval == 0:
                 self.save_checkpoint(step + 1)
+                t_last = time.perf_counter()  # exclude save time from next tok/s window
 
         self.save_checkpoint(self.max_steps)
         if self.is_main():

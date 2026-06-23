@@ -6,9 +6,10 @@ loss). Hashes every block's full input_ids across all shards and reports the
 duplicate rate. Exits non-zero if any duplicates are found.
 
 Usage:
-    python checks/check_dedup.py <save_dir>            # globs <save_dir>/shard_*
-    python checks/check_dedup.py <save_dir> --limit 200000   # cap blocks (fast)
+    python checks/check_dedup.py --save_dir /buckets/datasets/pajama_shards
+    python checks/check_dedup.py --save_dir <dir> --limit 200000   # cap blocks (fast)
 """
+import argparse
 import glob
 import os
 import sys
@@ -16,17 +17,29 @@ import sys
 from datasets import load_from_disk
 
 
-def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    save_dir = args[0] if args else "/buckets/datasets/pajama_shards"
-    limit = None
-    if "--limit" in sys.argv:
-        limit = int(sys.argv[sys.argv.index("--limit") + 1])
+def parse_args():
+    p = argparse.ArgumentParser(description="Check tokenized shards for duplicate blocks.")
+    p.add_argument("--save_dir", required=True,
+                   help="directory containing shard_* subfolders")
+    p.add_argument("--limit", type=int, default=None,
+                   help="stop after this many blocks (default: scan all)")
+    p.add_argument("--batch_size", type=int, default=2000,
+                   help="rows loaded per iteration (default: 2000)")
+    return p.parse_args()
 
-    shard_paths = sorted(glob.glob(os.path.join(save_dir, "shard_*")))
+
+def main():
+    args = parse_args()
+    print("=== check_dedup args ===")
+    for k, v in vars(args).items():
+        print(f"  {k} = {v}")
+    print("========================")
+
+    shard_paths = sorted(glob.glob(os.path.join(args.save_dir, "shard_*")))
     if not shard_paths:
-        print(f"ERROR: no shards at {save_dir}/shard_*")
+        print(f"ERROR: no shards at {args.save_dir}/shard_*")
         sys.exit(2)
+    print(f"found {len(shard_paths)} shards")
 
     seen = set()
     total = dups = 0
@@ -35,7 +48,7 @@ def main():
 
     for p in shard_paths:
         ds = load_from_disk(p)
-        for batch in ds.iter(batch_size=2000):
+        for batch in ds.iter(batch_size=args.batch_size):
             for ids in batch["input_ids"]:
                 if seq_len is None:
                     seq_len = len(ids)
@@ -47,18 +60,20 @@ def main():
                         dup_examples.append(list(ids[:16]))
                 else:
                     seen.add(key)
-                if limit and total >= limit:
+                if args.limit and total >= args.limit:
                     break
-            if limit and total >= limit:
+            if args.limit and total >= args.limit:
                 break
-        if limit and total >= limit:
+        if args.limit and total >= args.limit:
             break
 
     dup_rate = dups / total if total else 0.0
     tokens = total * (seq_len or 0)
-    print(f"shards={len(shard_paths)}  blocks={total:,}  unique={len(seen):,}  "
+    print(f"\nshards={len(shard_paths)}  blocks={total:,}  unique={len(seen):,}  "
           f"duplicates={dups:,}  dup_rate={dup_rate:.4f}  "
           f"tokens={tokens/1e9:.2f}B (seq_len={seq_len})")
+    if args.limit:
+        print(f"(scanned a capped {total:,} blocks; rerun without --limit for a full check)")
 
     if dups:
         print("FAIL: duplicate blocks found "
