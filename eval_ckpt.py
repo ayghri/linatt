@@ -18,7 +18,7 @@ import re
 
 import hydra
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import fla  # noqa: F401  -- registers fla model_types
@@ -30,14 +30,19 @@ def step_of(path):
     return int(m.group(1)) if m else -1
 
 
-def load_model(path, device):
+def load_model(path, device, hf_kwargs, tokenizer_name, run_id_fallback):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model = AutoModelForCausalLM.from_config(AutoConfig.for_model(**ckpt["hf_kwargs"]))
+    # Prefer values embedded in the checkpoint (self-contained); fall back to the
+    # hydra config for older checkpoints saved before they were embedded.
+    hf_kwargs = ckpt.get("hf_kwargs", hf_kwargs)
+    tokenizer_name = ckpt.get("tokenizer", tokenizer_name)
+    run_id = ckpt.get("wandb_run_id", run_id_fallback)
+    model = AutoModelForCausalLM.from_config(AutoConfig.for_model(**hf_kwargs))
     model.load_state_dict(ckpt["model"])
     model = model.to(device, dtype=torch.bfloat16).eval()
-    tok = AutoTokenizer.from_pretrained(ckpt["tokenizer"], trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
     return (model, tok, int(ckpt.get("step", -1)),
-            int(ckpt.get("tokens_seen", 0)), ckpt.get("wandb_run_id"))
+            int(ckpt.get("tokens_seen", 0)), run_id)
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="main.yaml")
@@ -46,6 +51,10 @@ def main(cfg: DictConfig) -> None:
     tasks = list(cfg.eval.tasks)
     batch_size = int(cfg.eval.batch_size)
     device = cfg.eval.get("device", "cuda:0")
+    # fallbacks for checkpoints that don't embed these (saved before that change)
+    hf_kwargs_cfg = OmegaConf.to_container(cfg.model.hf_kwargs, resolve=True)
+    tokenizer_cfg = cfg.data.tokenizer
+    run_id_cfg = cfg.wandb.get("run_id", None)  # +wandb.run_id=<id> to override
 
     paths = sorted(glob.glob(os.path.join(output_dir, "step_*.pt")), key=step_of)
     if not paths:
@@ -61,7 +70,8 @@ def main(cfg: DictConfig) -> None:
     wandb_run = None  # opened lazily from the first checkpoint's embedded run id
 
     for path in paths:
-        model, tok, step, tokens, run_id = load_model(path, device)
+        model, tok, step, tokens, run_id = load_model(
+            path, device, hf_kwargs_cfg, tokenizer_cfg, run_id_cfg)
         print(f"\n=== {os.path.basename(path)}  step={step}  tokens={tokens/1e9:.2f}B ===")
 
         if wandb_run is None and cfg.wandb.mode != "disabled" and run_id:
