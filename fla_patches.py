@@ -75,8 +75,15 @@ def _patch_tied_weights_keys() -> None:
 
 
 def _register_kata() -> None:
-    """Register the KATA model with HF Auto* (importing the package does it)."""
+    """Register the KATA model with HF Auto*.
+
+    `import kata` ALONE does not register: kata/__init__.py defers the Auto*
+    registration to first attribute access (__getattr__ -> _maybe_register), so
+    AutoConfig.for_model("kata") raises 'Unrecognized model identifier' unless we
+    touch a lazy symbol here. Accessing kata.KataConfig forces the registration.
+    """
     import kata  # noqa: F401
+    _ = kata.KataConfig  # triggers __getattr__ -> _maybe_register (Auto* registration)
 
 
 def _patch_fla_attn_to_sdpa_flash() -> None:

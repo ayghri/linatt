@@ -97,7 +97,11 @@ class KataAttention(nn.Module):
         self.use_rope = use_rope
         self.max_position_embeddings = max_position_embeddings
         if use_rope:
-            self.rotary = RotaryEmbedding(dim=self.head_k_dim, base=rope_theta)
+            # interleaved=True -> rotation pairs are adjacent (2i,2i+1) and stay WITHIN
+            # a contiguous SPD group, so each per-group (q_g.k_g)^2 is a clean function of
+            # relative position (m-n). The rotate-half default (interleaved=False) would
+            # split each pair across the group boundary and leak absolute position.
+            self.rotary = RotaryEmbedding(dim=self.head_k_dim, base=rope_theta, interleaved=True)
 
         self.feature_map_name = feature_map
         self.spd_num_groups = spd_num_groups
