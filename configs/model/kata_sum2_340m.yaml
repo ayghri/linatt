@@ -1,7 +1,8 @@
-name: kata_cat4_340m
+name: kata_sum2_340m
 # transformer_340m to the T, EXCEPT:
 #   (1) interleaved RoPE (interleaved=True, set in KataAttention)
-#   (2) kata concat-SPD M=4 attention instead of full softmax attention
+#   (2) kata sum-SPD M=2 attention instead of full softmax attention
+# sum-SPD score: A[t,s] = Sum_{i,j} (q_i . k_j)^2  (all cross-group pairs).
 # Mapping of transformer-only field names onto the kata layer (same behavior):
 #   qk_norm: true   -> norm_q: true + norm_k: true  (RMSNorm(head_dim, fp32) on q,k)
 #   qkv_bias: false -> kata projections are always bias-free (matches)
@@ -14,13 +15,13 @@ hf_kwargs:
   num_kv_heads: 16
   expand_k: 1.0
   expand_v: 1.0
-  feature_map: kata_quadratic     # concat-SPD score  Sum_i (q_i . k_i)^2
-  spd_num_groups: 4               # cat4  (E=16 per group)
-  spd_use_kernel: false           # routes to parallel_kata_attn flash kernel
-  norm_q: true                    # = transformer qk_norm (RMSNorm q before RoPE)
-  norm_k: true                    # = transformer qk_norm (RMSNorm k before RoPE)
-  use_short_conv: false           # transformer has NO short conv
-  use_rope: true                  # interleaved=True inside KataAttention
+  feature_map: kata_quadratic_sum  # sum-SPD score  Sum_{i,j} (q_i . k_j)^2
+  spd_num_groups: 2                # sum2  (E=32 per group)
+  spd_use_kernel: false            # routes to parallel_kata_attn_sum flash kernel
+  norm_q: true                     # = transformer qk_norm (RMSNorm q before RoPE)
+  norm_k: true                     # = transformer qk_norm (RMSNorm k before RoPE)
+  use_short_conv: false            # transformer has NO short conv
+  use_rope: true                   # interleaved=True inside KataAttention
   rope_theta: 10000.0
   rope_group: true        # per-group RoPE: each group rotated by the same factor
   max_position_embeddings: 2048

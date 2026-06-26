@@ -22,6 +22,7 @@ hf_kwargs:
   use_short_conv: false           # transformer has NO short conv
   use_rope: true                  # interleaved=True inside KataAttention
   rope_theta: 10000.0
+  rope_group: true        # per-group RoPE: each group rotated by the same factor
   max_position_embeddings: 2048
   hidden_ratio: 4
   hidden_act: swish

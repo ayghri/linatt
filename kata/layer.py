@@ -59,6 +59,7 @@ class KataAttention(nn.Module):
         norm_eps: float = 1e-5,
         use_rope: bool = False,
         rope_theta: float = 10000.0,
+        rope_group: bool = True,
         max_position_embeddings: int = 2048,
         layer_idx: int | None = None,
         **kwargs,
@@ -102,13 +103,20 @@ class KataAttention(nn.Module):
 
         # RoPE applied to q,k before the SPD score (same as self-attention).
         self.use_rope = use_rope
+        self.rope_group = rope_group
         self.max_position_embeddings = max_position_embeddings
         if use_rope:
-            # interleaved=True -> rotation pairs are adjacent (2i,2i+1) and stay WITHIN
-            # a contiguous SPD group, so each per-group (q_g.k_g)^2 is a clean function of
-            # relative position (m-n). The rotate-half default (interleaved=False) would
-            # split each pair across the group boundary and leak absolute position.
-            self.rotary = RotaryEmbedding(dim=self.head_k_dim, base=rope_theta, interleaved=True)
+            if rope_group:
+                # Per-group RoPE: rotate each E-dim group independently with the SAME
+                # frequencies (RotaryEmbedding(dim=E)). Every group is then full-spectrum
+                # AND relative-position, with an IDENTICAL positional factor across groups.
+                self.rotary = RotaryEmbedding(dim=self.head_k_dim // spd_num_groups, base=rope_theta)
+            else:
+                # Full-head RoPE, interleaved=True: pairs (2i,2i+1) stay within a contiguous
+                # group so each per-group dot is relative-position, but groups get DISJOINT
+                # frequency bands (low->group0, high->groupM-1). interleaved=False would
+                # straddle the group boundary and leak absolute position.
+                self.rotary = RotaryEmbedding(dim=self.head_k_dim, base=rope_theta, interleaved=True)
 
         self.feature_map_name = feature_map
         self.spd_num_groups = spd_num_groups
@@ -248,7 +256,19 @@ class KataAttention(nn.Module):
             if past_key_values is not None and self.layer_idx is not None:
                 seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
             max_seqlen = max(q.shape[1] + seqlen_offset, self.max_position_embeddings)
-            q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen)
+            if self.rope_group:
+                # treat each E-dim group as its own head: (B,T,H,D) -> (B,T,H*M,E),
+                # rotate with RotaryEmbedding(dim=E), reshape back.
+                Bz, Tl, Hq = q.shape[0], q.shape[1], q.shape[2]
+                Hk = k.shape[2]
+                E = self.head_k_dim // self.spd_num_groups
+                qg = q.reshape(Bz, Tl, Hq * self.spd_num_groups, E)
+                kg = k.reshape(Bz, Tl, Hk * self.spd_num_groups, E)
+                qg, kg = self.rotary(qg, kg, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen)
+                q = qg.reshape(Bz, Tl, Hq, self.head_k_dim)
+                k = kg.reshape(Bz, Tl, Hk, self.head_k_dim)
+            else:
+                q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen)
 
         # SPD kernel path: skip psi materialization, hand raw projections to
         # the on-the-fly Triton kernel. Only valid for chunk mode (no varlen,

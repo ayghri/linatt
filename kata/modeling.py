@@ -74,6 +74,7 @@ class KataBlock(GradientCheckpointingLayer):
                 conv_bias=config.conv_bias,
                 use_rope=config.use_rope,
                 rope_theta=config.rope_theta,
+                rope_group=config.rope_group,
                 max_position_embeddings=config.max_position_embeddings,
                 elementwise_affine=config.elementwise_affine,
                 norm_eps=config.norm_eps,
