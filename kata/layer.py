@@ -93,6 +93,13 @@ class KataAttention(nn.Module):
         self.head_v_dim = self.value_dim // num_heads
         self.layer_idx = layer_idx
 
+        # norm_q/norm_k: RMSNorm(head_dim, fp32) on q/k before the score, applied the
+        # SAME way self-attention applies qk-norm (fla Attention q_norm/k_norm). No psi.
+        if norm_q:
+            self.q_norm = RMSNorm(self.head_k_dim, dtype=torch.float32)
+        if norm_k:
+            self.k_norm = RMSNorm(self.head_k_dim, dtype=torch.float32)
+
         # RoPE applied to q,k before the SPD score (same as self-attention).
         self.use_rope = use_rope
         self.max_position_embeddings = max_position_embeddings
@@ -230,7 +237,12 @@ class KataAttention(nn.Module):
             k = rearrange(k, "... (h d) -> ... h d", d=self.head_k_dim)
             v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
 
-        # RoPE on q,k (B,T,H,head_k_dim) before the SPD score -- same as self-attn.
+        # norm_q/norm_k THEN RoPE on q,k (B,T,H,head_k_dim) before the SPD score --
+        # exact transformer order (qk_norm at fla Attention L106, rotary at L124).
+        if self.norm_q:
+            q = self.q_norm(q)
+        if self.norm_k:
+            k = self.k_norm(k)
         if self.use_rope:
             seqlen_offset = 0
             if past_key_values is not None and self.layer_idx is not None:

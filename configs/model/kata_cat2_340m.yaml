@@ -1,28 +1,30 @@
 name: kata_cat2_340m
-# Concat-SPD, M=2 groups, via parallel_kata_attn (flash SPD).
-# A[t,s] = Sum_{i=1..2} (q_i . k_i)^2  (same-group squared dots, no cross terms).
+# transformer_340m to the T, EXCEPT:
+#   (1) interleaved RoPE (interleaved=True, set in KataAttention)
+#   (2) kata concat-SPD M=2 attention instead of full softmax attention
+# Mapping of transformer-only field names onto the kata layer (same behavior):
+#   qk_norm: true   -> norm_q: true + norm_k: true  (RMSNorm(head_dim, fp32) on q,k)
+#   qkv_bias: false -> kata projections are always bias-free (matches)
+#   window_size: null -> kata is full attention (matches)
 hf_kwargs:
   model_type: kata
   hidden_size: 1024
   num_hidden_layers: 24
   num_heads: 16
+  num_kv_heads: 16
   expand_k: 1.0
   expand_v: 1.0
-  feature_map: kata_quadratic
-  spd_num_groups: 2
-  spd_use_kernel: false
-  feature_map_eps: 1.0e-6
-  norm_q: false
-  norm_k: false
-  use_short_conv: true
-  conv_size: 4
-  conv_bias: false
-  use_rope: true          # RoPE on q,k before the SPD score (like self-attention)
+  feature_map: kata_quadratic     # concat-SPD score  Sum_i (q_i . k_i)^2
+  spd_num_groups: 2               # cat2
+  spd_use_kernel: false           # routes to parallel_kata_attn flash kernel
+  norm_q: true                    # = transformer qk_norm (RMSNorm q before RoPE)
+  norm_k: true                    # = transformer qk_norm (RMSNorm k before RoPE)
+  use_short_conv: false           # transformer has NO short conv
+  use_rope: true                  # interleaved=True inside KataAttention
   rope_theta: 10000.0
-  attn_mode: chunk
+  max_position_embeddings: 2048
   hidden_ratio: 4
   hidden_act: swish
-  max_position_embeddings: 2048
   norm_eps: 1.0e-6
   tie_word_embeddings: true
   fuse_norm: true
