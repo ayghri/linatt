@@ -59,7 +59,7 @@ class KataAttention(nn.Module):
         norm_eps: float = 1e-5,
         use_rope: bool = False,
         rope_theta: float = 10000.0,
-        rope_group: bool = True,
+        rope_group: bool = False,
         max_position_embeddings: int = 2048,
         layer_idx: int | None = None,
         **kwargs,

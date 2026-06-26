@@ -9,6 +9,7 @@ Launch (CUDA_HOME needed for fla's tilelang GDN backward):
 """
 
 import glob
+import json
 import math
 import os
 import random
@@ -169,6 +170,9 @@ class DDPLLMPretrainer:
         os.makedirs(self.save_dir, exist_ok=True)
         ckpt = {
             "step": step,
+            # model architecture config, so resume rebuilds the EXACT model from the
+            # checkpoint -- never from the (possibly later-changed) yaml/code defaults.
+            "config": self.model.module.config.to_dict(),
             "model": self.model.module.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "tokens_seen": step * self.tokens_per_step,
@@ -180,6 +184,8 @@ class DDPLLMPretrainer:
         torch.save(ckpt, os.path.join(self.save_dir, f"step_{step}.pt"))
         # stable name so `resume=latest` always finds the newest state.
         torch.save(ckpt, os.path.join(self.save_dir, "latest.pt"))
+        # human-readable copy of the architecture next to the weights.
+        self.model.module.config.to_json_file(os.path.join(self.save_dir, "config.json"))
 
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
@@ -309,14 +315,42 @@ def load_sharded_dataset(save_dir):
     return ds.with_format("torch", columns=["input_ids"])
 
 
+def build_model(cfg):
+    """Construct the model architecture.
+
+    Base architecture comes from the NAMED config (cfg.model.hf_kwargs). On resume,
+    if the checkpoint path has a saved model config, its fields OVERRIDE the base --
+    so a resumed run uses the exact architecture it was trained with, while later
+    yaml/code-default changes (e.g. a flipped `rope_group` default) only affect
+    fields the checkpoint never recorded. Backward compatible: old checkpoints with
+    no saved config simply use the yaml.
+    """
+    hf_kwargs = OmegaConf.to_container(cfg.model.hf_kwargs, resolve=True)
+    resume = cfg.train.get("resume", None)
+    if resume == "latest":
+        resume = os.path.join(cfg.output_dir, "latest.pt")
+    saved = None
+    if resume and os.path.exists(resume):
+        cfg_json = os.path.join(os.path.dirname(resume) or ".", "config.json")
+        if os.path.exists(cfg_json):
+            with open(cfg_json) as f:
+                saved = json.load(f)
+        else:  # older checkpoints embed the config in the .pt instead of config.json
+            saved = torch.load(resume, map_location="cpu", weights_only=False).get("config")
+    if saved:
+        hf_kwargs = {**hf_kwargs, **saved}   # checkpoint config overrides the named config
+        print(f"[resume] arch = cfg.model.hf_kwargs overridden by saved checkpoint config "
+              f"({resume})")
+    return AutoModelForCausalLM.from_config(AutoConfig.for_model(**hf_kwargs))
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="main.yaml")
 def main(cfg: DictConfig) -> None:
     # ---- model: fp32 MASTER weights; bf16 compute via autocast in the loop. ----
     # fla's fused triton kernels (norm/swiglu/(linear-)CE + chunk-scan mixer) are
     # the optimization; we run them eager (no torch.compile -- Inductor can't
     # trace them and only fuses un-fused ops, of which fla leaves none).
-    hf_kwargs = OmegaConf.to_container(cfg.model.hf_kwargs, resolve=True)
-    model = AutoModelForCausalLM.from_config(AutoConfig.for_model(**hf_kwargs))
+    model = build_model(cfg)
     if cfg.train.get("pure_bf16", False):
         model = model.to(torch.bfloat16)  # A/B control: bf16 master (defective)
     else:

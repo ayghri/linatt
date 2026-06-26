@@ -88,9 +88,14 @@ _BWD_CONFIGS = [
     triton.Config({"BT": 128, "BS": 128}, num_warps=8, num_stages=1),
 ]
 
-_FWD_KEY = ["T", "K_d", "V_d", "M"]
-_BWD_KEY_M1 = ["T", "K_d", "V_d"]
-_BWD_KEY_ME = ["T", "K_d", "V_d", "E"]
+# NOTE: do NOT key on T (sequence length). The optimal tile (BT/BS/warps/stages)
+# depends on head-dim and group count, not on T (per-program work is T-independent),
+# so keying on T forces a full autotune sweep for every distinct sequence length --
+# which makes eval/generation (variable/growing T) crawl, especially on A100 where
+# each sweep is slower. Tune once per (K_d, V_d, M/E) and reuse across all lengths.
+_FWD_KEY = ["K_d", "V_d", "M"]
+_BWD_KEY_M1 = ["K_d", "V_d"]
+_BWD_KEY_ME = ["K_d", "V_d", "E"]
 
 
 @triton.autotune(configs=_FWD_CONFIGS, key=_FWD_KEY)

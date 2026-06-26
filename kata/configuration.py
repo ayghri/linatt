@@ -38,7 +38,7 @@ class KataConfig(PretrainedConfig):
         conv_bias: bool = False,
         use_rope: bool = False,
         rope_theta: float = 10000.0,
-        rope_group: bool = True,
+        rope_group: bool = False,
         hidden_act: str = "swish",
         max_position_embeddings: int = 2048,
         elementwise_affine: bool | None = True,
