@@ -14,7 +14,7 @@ import torch.nn as nn
 from einops import rearrange, repeat
 
 from fla.layers.utils import get_layer_cache, update_layer_cache
-from fla.modules import RMSNorm, ShortConvolution
+from fla.modules import RMSNorm, RotaryEmbedding, ShortConvolution
 from fla.ops.linear_attn import (
     chunk_linear_attn,
     fused_chunk_linear_attn,
@@ -57,6 +57,9 @@ class KataAttention(nn.Module):
         output_norm: str = "rmsnorm",
         elementwise_affine: bool = True,
         norm_eps: float = 1e-5,
+        use_rope: bool = False,
+        rope_theta: float = 10000.0,
+        max_position_embeddings: int = 2048,
         layer_idx: int | None = None,
         **kwargs,
     ):
@@ -89,6 +92,12 @@ class KataAttention(nn.Module):
         self.head_k_dim = self.key_dim // num_heads
         self.head_v_dim = self.value_dim // num_heads
         self.layer_idx = layer_idx
+
+        # RoPE applied to q,k before the SPD score (same as self-attention).
+        self.use_rope = use_rope
+        self.max_position_embeddings = max_position_embeddings
+        if use_rope:
+            self.rotary = RotaryEmbedding(dim=self.head_k_dim, base=rope_theta)
 
         self.feature_map_name = feature_map
         self.spd_num_groups = spd_num_groups
@@ -216,6 +225,14 @@ class KataAttention(nn.Module):
         else:
             k = rearrange(k, "... (h d) -> ... h d", d=self.head_k_dim)
             v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
+
+        # RoPE on q,k (B,T,H,head_k_dim) before the SPD score -- same as self-attn.
+        if self.use_rope:
+            seqlen_offset = 0
+            if past_key_values is not None and self.layer_idx is not None:
+                seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
+            max_seqlen = max(q.shape[1] + seqlen_offset, self.max_position_embeddings)
+            q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen)
 
         # SPD kernel path: skip psi materialization, hand raw projections to
         # the on-the-fly Triton kernel. Only valid for chunk mode (no varlen,

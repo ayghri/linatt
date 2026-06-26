@@ -36,6 +36,8 @@ class KataConfig(PretrainedConfig):
         use_short_conv: bool = False,
         conv_size: int = 4,
         conv_bias: bool = False,
+        use_rope: bool = False,
+        rope_theta: float = 10000.0,
         hidden_act: str = "swish",
         max_position_embeddings: int = 2048,
         elementwise_affine: bool | None = True,
@@ -72,6 +74,8 @@ class KataConfig(PretrainedConfig):
         self.norm_q = norm_q
         self.norm_k = norm_k
         self.use_short_conv = use_short_conv
+        self.use_rope = use_rope
+        self.rope_theta = rope_theta
         self.conv_size = conv_size
         self.conv_bias = conv_bias
         self.hidden_act = hidden_act

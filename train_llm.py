@@ -97,7 +97,9 @@ class DDPLLMPretrainer:
         self.warmup_steps = int(tr.warmup_tokens) // self.tokens_per_step
         self.progress_interval = int(tr.progress_interval)
         # checkpoint every checkpoint_rate * max_steps steps (+ step 0 and last).
-        self.checkpoint_interval = max(1, round(float(cfg.checkpoint_rate) * self.max_steps))
+        self.checkpoint_interval = max(
+            1, round(float(cfg.checkpoint_rate) * self.max_steps)
+        )
         self.max_grad_norm = float(tr.max_grad_norm)
         self.save_dir = cfg.output_dir
 
@@ -190,8 +192,10 @@ class DDPLLMPretrainer:
         self.start_step = int(ckpt["step"])
         self.scheduler.update(self.start_step)  # restore lr for the resume step
         if self.is_main():
-            print(f"resumed from {path} at step {self.start_step} "
-                  f"({ckpt.get('tokens_seen', 0)/1e9:.2f}B tokens)")
+            print(
+                f"resumed from {path} at step {self.start_step} "
+                f"({ckpt.get('tokens_seen', 0)/1e9:.2f}B tokens)"
+            )
 
     def train(self):
         self.model.train()
@@ -205,13 +209,19 @@ class DDPLLMPretrainer:
         self.sampler.set_epoch(0)
         loader = iter(self.dataloader)
         if self.start_step > 0:
-            for _ in tqdm(range(self.start_step * self.grad_accum),
-                          desc="skip seen data", disable=not self.is_main()):
+            for _ in tqdm(
+                range(self.start_step * self.grad_accum),
+                desc="skip seen data",
+                disable=not self.is_main(),
+            ):
                 next(loader)
 
-        pbar = tqdm(range(self.start_step, self.max_steps),
-                    initial=self.start_step, total=self.max_steps,
-                    disable=not self.is_main())
+        pbar = tqdm(
+            range(self.start_step, self.max_steps),
+            initial=self.start_step,
+            total=self.max_steps,
+            disable=not self.is_main(),
+        )
 
         if self.start_step == 0:
             self.save_checkpoint(0)  # sanity: checkpoint the random init at step 0
