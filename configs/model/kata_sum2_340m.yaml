@@ -22,8 +22,9 @@ hf_kwargs:
   norm_k: true                     # = transformer qk_norm (RMSNorm k before RoPE)
   use_short_conv: false            # transformer has NO short conv
   use_rope: true                   # interleaved=True inside KataAttention
-  rope_theta: 10000.0
-  rope_group: true        # per-group RoPE: each group rotated by the same factor
+  rope_theta: 20000.0     # 2x full attention's 10000: doubles the period to undo the
+                          # SPD square's frequency-doubling (theta=period, inverse of freq)
+  rope_group: false       # full-head interleaved RoPE (per-group was a net negative)
   max_position_embeddings: 2048
   hidden_ratio: 4
   hidden_act: swish

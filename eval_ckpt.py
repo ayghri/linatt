@@ -34,8 +34,16 @@ def to_plain(obj):
 
 
 def load_model(path, device, hf_kwargs, tokenizer_name):
-    # Architecture from the hydra config; checkpoint holds only the weights.
+    # Base architecture from the hydra config, then OVERRIDE with the config the
+    # checkpoint was trained with (if saved) -- otherwise post-training arch changes
+    # (e.g. full-head -> per-group RoPE, which has no weights so it loads silently)
+    # corrupt eval with abnormally high PPL. Old checkpoints w/o a saved config use
+    # the yaml as-is; set the matching flags there manually to match how it trained.
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    saved = ckpt.get("config")
+    if saved:
+        hf_kwargs = {**hf_kwargs, **saved}
+        print(f"[eval] architecture overridden by checkpoint-saved config ({path})")
     model = AutoModelForCausalLM.from_config(AutoConfig.for_model(**hf_kwargs))
     model.load_state_dict(ckpt["model"])
     model = model.to(device, dtype=torch.bfloat16).eval()
