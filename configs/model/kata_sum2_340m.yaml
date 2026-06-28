@@ -4,8 +4,7 @@ name: kata_sum2_340m
 #   (2) kata sum-SPD M=2 attention instead of full softmax attention
 # sum-SPD score: A[t,s] = Sum_{i,j} (q_i . k_j)^2  (all cross-group pairs).
 # Mapping of transformer-only field names onto the kata layer (same behavior):
-#   qk_norm: true   -> norm_q: true + norm_k: true  (RMSNorm(head_dim, fp32) on q,k)
-#   qkv_bias: false -> kata projections are always bias-free (matches)
+##   qkv_bias: false -> kata projections are always bias-free (matches)
 #   window_size: null -> kata is full attention (matches)
 hf_kwargs:
   model_type: kata
@@ -18,8 +17,9 @@ hf_kwargs:
   feature_map: kata_quadratic_sum  # sum-SPD score  Sum_{i,j} (q_i . k_j)^2
   spd_num_groups: 2                # sum2  (E=32 per group)
   spd_use_kernel: false            # routes to parallel_kata_attn_sum flash kernel
-  norm_q: true                     # = transformer qk_norm (RMSNorm q before RoPE)
-  norm_k: true                     # = transformer qk_norm (RMSNorm k before RoPE)
+  qk_norm: true                   # master switch for qk normalization
+  norm_q: rmsnorm                   # norm TYPE for q: rmsnorm | l2
+  norm_k: rmsnorm                   # norm TYPE for k
   use_short_conv: false            # transformer has NO short conv
   use_rope: true                   # interleaved=True inside KataAttention
   rope_theta: 20000.0     # 2x full attention's 10000: doubles the period to undo the

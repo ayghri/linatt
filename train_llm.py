@@ -45,6 +45,65 @@ def init_dist(backend=None):
     return device, local_rank, rank, dist.get_world_size()
 
 
+def _grad_group(name):
+    """Bucket a parameter name into a coarse module group for grad-norm logging."""
+    n = name.lower()
+    if "conv1d" in n:
+        return "conv"
+    if "q_proj" in n or "k_proj" in n or "v_proj" in n:
+        return "qkv_proj"
+    if "o_proj" in n:
+        return "o_proj"
+    if "q_norm" in n or "k_norm" in n:
+        return "qk_norm"
+    if "a_proj" in n or "b_proj" in n or "g_proj" in n or "a_log" in n or "dt_bias" in n:
+        return "gdn_gate"       # GDN decay / beta / output gate
+    if "embeddings" in n or "embed" in n:
+        return "embed"
+    if "lm_head" in n:
+        return "head"
+    if "mlp" in n or "gate_proj" in n or "up_proj" in n or "down_proj" in n or "swiglu" in n:
+        return "mlp"
+    if "norm" in n:
+        return "norm"
+    return "other"
+
+
+def clip_grad_and_group_norms(named_parameters, max_norm, norm_type=2.0, return_groups=True):
+    """Drop-in for torch.nn.utils.clip_grad_norm_ that can ALSO return per-module-group
+    grad norms -- computing each parameter's grad norm only ONCE (via the same
+    torch._foreach_norm the clip uses) and reusing it for both the total-norm clip
+    and the grouping.
+
+    With return_groups=False this is exactly torch's clip (no grouping overhead), so
+    the per-group breakdown can be computed only at a logging interval. Mutates grads
+    in place (clips). DDP has already synced grads, so the values are global.
+    """
+    names, grads = [], []
+    for name, p in named_parameters:
+        if p.grad is not None:
+            if return_groups:
+                names.append(name)
+            grads.append(p.grad)
+    if not grads:
+        return torch.tensor(0.0), {}
+    # per-parameter norms in one fused pass -- exactly what clip_grad_norm_ does
+    norms = torch._foreach_norm(grads, norm_type)
+    norms_t = torch.stack(norms)
+    total_norm = torch.linalg.vector_norm(norms_t, norm_type)
+    # clip in place (launch before the CPU sync so the foreach_mul runs async)
+    clip_coef = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
+    torch._foreach_mul_(grads, clip_coef)
+    if not return_groups:
+        return total_norm, {}
+    # group: ||group|| = sqrt(sum of per-param norm^2). One .tolist() sync, then pure python.
+    sq = {}
+    for name, nv in zip(names, norms_t.tolist()):
+        g = _grad_group(name)
+        sq[g] = sq.get(g, 0.0) + nv * nv
+    return total_norm, {g: math.sqrt(v) for g, v in sq.items()}
+
+
 class WarmedUpScheduler:
     """Linear warmup (min_lr -> peak_lr) then cosine decay back to min_lr,
     where min_lr = min_lr_rate * peak_lr (peak_lr is the configured `lr`)."""
@@ -258,8 +317,12 @@ class DDPLLMPretrainer:
                     loss.backward()
                 step_loss += loss.detach()
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.max_grad_norm
+            # Clip EVERY step; compute the per-group grad-norm breakdown only at the
+            # loss_reduced cadence (return_groups=False -> exactly torch's clip cost).
+            log_reduced = (step + 1) % self.progress_interval == 0
+            grad_norm, group_norms = clip_grad_and_group_norms(
+                self.model.module.named_parameters(), self.max_grad_norm,
+                return_groups=log_reduced,
             )
             self.optimizer.step()
             lr = self.scheduler.update(
@@ -268,7 +331,6 @@ class DDPLLMPretrainer:
 
             # Cross-worker reduced loss only every progress_interval -- all_reduce is
             # a collective, so ALL ranks must call it (outside the is_main guard).
-            log_reduced = (step + 1) % self.progress_interval == 0
             if log_reduced:
                 reduced = step_loss.detach().clone()
                 dist.all_reduce(reduced, op=dist.ReduceOp.AVG)
@@ -286,6 +348,7 @@ class DDPLLMPretrainer:
                 }
                 if log_reduced:
                     metrics["loss_reduced"] = reduced.item()  # mean across workers
+                    metrics.update({f"gradnorm/{g}": v for g, v in group_norms.items()})
                 wandb.log(metrics, step=step + 1)
                 pbar.set_postfix(
                     {

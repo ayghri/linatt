@@ -1,6 +1,6 @@
-name: kataconv_cat_340m
-# Conv-based concat-SPD (the original, more-promising approach): short conv on
-# q/k/v, NO RoPE, NO qk-norm. A[t,s] = Sum_i (q_i . k_i)^2, M=2 groups.
+name: kataconv_cat_l2_340m
+# Conv-based concat-SPD with GDN-style L2 qk-norm: short conv on q/k/v, NO RoPE,
+# qk_norm=l2 (parameter-free x/||x|| -> q.k in [-1,1] -> (q.k)^2 in [0,1]).
 hf_kwargs:
   model_type: kata
   hidden_size: 1024
@@ -13,8 +13,8 @@ hf_kwargs:
   spd_use_kernel: false
   feature_map_eps: 1.0e-6
   qk_norm: true                   # master switch for qk normalization
-  norm_q: rmsnorm                   # norm TYPE for q: rmsnorm | l2
-  norm_k: rmsnorm                   # norm TYPE for k
+  norm_q: l2                   # norm TYPE for q: rmsnorm | l2
+  norm_k: l2                   # norm TYPE for k
   use_short_conv: true
   conv_size: 4
   conv_bias: false

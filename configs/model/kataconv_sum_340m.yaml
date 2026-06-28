@@ -12,8 +12,9 @@ hf_kwargs:
   spd_num_groups: 2
   spd_use_kernel: false
   feature_map_eps: 1.0e-6
-  norm_q: true                    # qk-norm: RMSNorm(head_dim, fp32) on q
-  norm_k: true                    # qk-norm: RMSNorm(head_dim, fp32) on k
+  qk_norm: true                   # master switch for qk normalization
+  norm_q: rmsnorm                   # norm TYPE for q: rmsnorm | l2
+  norm_k: rmsnorm                   # norm TYPE for k
   use_short_conv: true
   conv_size: 4
   conv_bias: false

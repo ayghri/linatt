@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
+import torch.nn.functional as F
 
 from fla.layers.utils import get_layer_cache, update_layer_cache
 from fla.modules import RMSNorm, RotaryEmbedding, ShortConvolution
@@ -49,8 +50,9 @@ class KataAttention(nn.Module):
         spd_use_kernel: bool = False,
         spd_chunk_size: int = 32,
         feature_map_eps: float = 1e-6,
-        norm_q: bool = False,
-        norm_k: bool = False,
+        qk_norm: bool = False,
+        norm_q: str = "rmsnorm",
+        norm_k: str = "rmsnorm",
         use_short_conv: bool = False,
         conv_size: int = 4,
         conv_bias: bool = False,
@@ -94,11 +96,18 @@ class KataAttention(nn.Module):
         self.head_v_dim = self.value_dim // num_heads
         self.layer_idx = layer_idx
 
-        # norm_q/norm_k: RMSNorm(head_dim, fp32) on q/k before the score, applied the
-        # SAME way self-attention applies qk-norm (fla Attention q_norm/k_norm). No psi.
-        if norm_q:
+        # qk-norm on q/k before the score (after conv, same position as GDN).
+        # qk_norm (bool) = master on/off; norm_q/norm_k = the TYPE per side:
+        #   "rmsnorm" -> transformer-style RMSNorm (learnable scale)
+        #   "l2"      -> GDN-style parameter-free l2-norm (x/||x||): q.k in [-1,1] so
+        #               the SPD square (q.k)^2 stays in [0,1] (well-conditioned).
+        for _nm, _v in (("norm_q", norm_q), ("norm_k", norm_k)):
+            if _v not in ("rmsnorm", "l2"):
+                raise ValueError(f"{_nm} must be 'rmsnorm' or 'l2', got {_v!r}")
+        self.qk_norm = qk_norm
+        if qk_norm and norm_q == "rmsnorm":
             self.q_norm = RMSNorm(self.head_k_dim, dtype=torch.float32)
-        if norm_k:
+        if qk_norm and norm_k == "rmsnorm":
             self.k_norm = RMSNorm(self.head_k_dim, dtype=torch.float32)
 
         # RoPE applied to q,k before the SPD score (same as self-attention).
@@ -110,13 +119,17 @@ class KataAttention(nn.Module):
                 # Per-group RoPE: rotate each E-dim group independently with the SAME
                 # frequencies (RotaryEmbedding(dim=E)). Every group is then full-spectrum
                 # AND relative-position, with an IDENTICAL positional factor across groups.
-                self.rotary = RotaryEmbedding(dim=self.head_k_dim // spd_num_groups, base=rope_theta)
+                self.rotary = RotaryEmbedding(
+                    dim=self.head_k_dim // spd_num_groups, base=rope_theta
+                )
             else:
                 # Full-head RoPE, interleaved=True: pairs (2i,2i+1) stay within a contiguous
                 # group so each per-group dot is relative-position, but groups get DISJOINT
                 # frequency bands (low->group0, high->groupM-1). interleaved=False would
                 # straddle the group boundary and leak absolute position.
-                self.rotary = RotaryEmbedding(dim=self.head_k_dim, base=rope_theta, interleaved=True)
+                self.rotary = RotaryEmbedding(
+                    dim=self.head_k_dim, base=rope_theta, interleaved=True
+                )
 
         self.feature_map_name = feature_map
         self.spd_num_groups = spd_num_groups
@@ -159,16 +172,22 @@ class KataAttention(nn.Module):
         self.conv_size = conv_size
         if use_short_conv:
             self.q_conv1d = ShortConvolution(
-                hidden_size=self.key_dim, kernel_size=conv_size,
-                bias=conv_bias, activation="silu",
+                hidden_size=self.key_dim,
+                kernel_size=conv_size,
+                bias=conv_bias,
+                activation="silu",
             )
             self.k_conv1d = ShortConvolution(
-                hidden_size=self.key_dim_per_group, kernel_size=conv_size,
-                bias=conv_bias, activation="silu",
+                hidden_size=self.key_dim_per_group,
+                kernel_size=conv_size,
+                bias=conv_bias,
+                activation="silu",
             )
             self.v_conv1d = ShortConvolution(
-                hidden_size=self.value_dim_per_group, kernel_size=conv_size,
-                bias=conv_bias, activation="silu",
+                hidden_size=self.value_dim_per_group,
+                kernel_size=conv_size,
+                bias=conv_bias,
+                activation="silu",
             )
 
         if output_norm == "rmsnorm":
@@ -208,15 +227,18 @@ class KataAttention(nn.Module):
                     "conv_state", (None, None, None)
                 )
             q, conv_state_q = self.q_conv1d(
-                x=self.q_proj(hidden_states), cache=conv_state_q,
+                x=self.q_proj(hidden_states),
+                cache=conv_state_q,
                 output_final_state=use_cache,
             )
             k, conv_state_k = self.k_conv1d(
-                x=self.k_proj(hidden_states), cache=conv_state_k,
+                x=self.k_proj(hidden_states),
+                cache=conv_state_k,
                 output_final_state=use_cache,
             )
             v, conv_state_v = self.v_conv1d(
-                x=self.v_proj(hidden_states), cache=conv_state_v,
+                x=self.v_proj(hidden_states),
+                cache=conv_state_v,
                 output_final_state=use_cache,
             )
         else:
@@ -245,17 +267,26 @@ class KataAttention(nn.Module):
             k = rearrange(k, "... (h d) -> ... h d", d=self.head_k_dim)
             v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
 
-        # norm_q/norm_k THEN RoPE on q,k (B,T,H,head_k_dim) before the SPD score --
-        # exact transformer order (qk_norm at fla Attention L106, rotary at L124).
-        if self.norm_q:
-            q = self.q_norm(q)
-        if self.norm_k:
-            k = self.k_norm(k)
+        # qk-norm THEN RoPE on q,k (B,T,H,head_k_dim) before the SPD score -- exact
+        # transformer order (qk_norm at fla Attention L106, rotary at L124).
+        if self.qk_norm:
+            q = (
+                F.normalize(q.float(), dim=-1).to(q.dtype)
+                if self.norm_q == "l2"
+                else self.q_norm(q)
+            )
+            k = (
+                F.normalize(k.float(), dim=-1).to(k.dtype)
+                if self.norm_k == "l2"
+                else self.k_norm(k)
+            )
         if self.use_rope:
             seqlen_offset = 0
             if past_key_values is not None and self.layer_idx is not None:
                 seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
-            max_seqlen = max(q.shape[1] + seqlen_offset, self.max_position_embeddings)
+            max_seqlen = max(
+                q.shape[1] + seqlen_offset, self.max_position_embeddings
+            )
             if self.rope_group:
                 # treat each E-dim group as its own head: (B,T,H,D) -> (B,T,H*M,E),
                 # rotate with RotaryEmbedding(dim=E), reshape back.
@@ -264,11 +295,15 @@ class KataAttention(nn.Module):
                 E = self.head_k_dim // self.spd_num_groups
                 qg = q.reshape(Bz, Tl, Hq * self.spd_num_groups, E)
                 kg = k.reshape(Bz, Tl, Hk * self.spd_num_groups, E)
-                qg, kg = self.rotary(qg, kg, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen)
+                qg, kg = self.rotary(
+                    qg, kg, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen
+                )
                 q = qg.reshape(Bz, Tl, Hq, self.head_k_dim)
                 k = kg.reshape(Bz, Tl, Hk, self.head_k_dim)
             else:
-                q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen)
+                q, k = self.rotary(
+                    q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen
+                )
 
         # SPD kernel path: skip psi materialization, hand raw projections to
         # the on-the-fly Triton kernel. Only valid for chunk mode (no varlen,
@@ -304,29 +339,46 @@ class KataAttention(nn.Module):
             if grad_on:
                 if is_sum:
                     o = parallel_kata_attn_sum(
-                        q, k, v, num_groups=self.spd_num_groups, scale=None,
+                        q,
+                        k,
+                        v,
+                        num_groups=self.spd_num_groups,
+                        scale=None,
                     )
                 else:
                     o = parallel_kata_attn(
-                        q, k, v, num_groups=self.spd_num_groups, scale=None,
+                        q,
+                        k,
+                        v,
+                        num_groups=self.spd_num_groups,
+                        scale=None,
                     )
             else:
                 if is_sum:
                     o, _ = parallel_kata_attn_sum_fwd_impl(
-                        q, k, v, self.spd_num_groups, None, 64, 64,
+                        q,
+                        k,
+                        v,
+                        self.spd_num_groups,
+                        None,
+                        64,
+                        64,
                     )
                 else:
                     o, _ = parallel_kata_attn_fwd(
-                        q, k, v, num_groups=self.spd_num_groups, scale=None,
+                        q,
+                        k,
+                        v,
+                        num_groups=self.spd_num_groups,
+                        scale=None,
                     )
             final_state = None
         else:
             # pre-materialize psi(q), psi(k) and route through FLA kernels
             q = self.feature_map(q)
             k = self.feature_map(k)
-            if self.norm_q:
+            if self.qk_norm:  # legacy psi-feature sum-norm (positive/lorentz maps)
                 q = q / (q.sum(-1, True) + 1e-4)
-            if self.norm_k:
                 k = k / (k.sum(-1, True) + 1e-4)
             if mode == "chunk":
                 o, final_state = chunk_linear_attn(

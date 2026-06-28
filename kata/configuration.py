@@ -31,8 +31,9 @@ class KataConfig(PretrainedConfig):
         spd_use_kernel: bool = False,
         spd_chunk_size: int = 32,
         feature_map_eps: float = 1e-6,
-        norm_q: bool = False,
-        norm_k: bool = False,
+        qk_norm: bool = False,
+        norm_q: str = "rmsnorm",
+        norm_k: str = "rmsnorm",
         use_short_conv: bool = False,
         conv_size: int = 4,
         conv_bias: bool = False,
@@ -72,6 +73,7 @@ class KataConfig(PretrainedConfig):
         self.spd_use_kernel = spd_use_kernel
         self.spd_chunk_size = spd_chunk_size
         self.feature_map_eps = feature_map_eps
+        self.qk_norm = qk_norm
         self.norm_q = norm_q
         self.norm_k = norm_k
         self.use_short_conv = use_short_conv
