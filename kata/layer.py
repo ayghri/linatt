@@ -12,10 +12,10 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
-import torch.nn.functional as F
 
 from fla.layers.utils import get_layer_cache, update_layer_cache
 from fla.modules import RMSNorm, RotaryEmbedding, ShortConvolution
+from fla.modules.l2norm import l2norm  # the function (fla.modules.l2norm is the submodule)
 from fla.ops.linear_attn import (
     chunk_linear_attn,
     fused_chunk_linear_attn,
@@ -270,16 +270,10 @@ class KataAttention(nn.Module):
         # qk-norm THEN RoPE on q,k (B,T,H,head_k_dim) before the SPD score -- exact
         # transformer order (qk_norm at fla Attention L106, rotary at L124).
         if self.qk_norm:
-            q = (
-                F.normalize(q.float(), dim=-1).to(q.dtype)
-                if self.norm_q == "l2"
-                else self.q_norm(q)
-            )
-            k = (
-                F.normalize(k.float(), dim=-1).to(k.dtype)
-                if self.norm_k == "l2"
-                else self.k_norm(k)
-            )
+            # l2 -> fla's FUSED l2norm (single Triton kernel, fp32 internal, no extra
+            # bf16<->fp32 copies); rmsnorm -> the RMSNorm module.
+            q = l2norm(q) if self.norm_q == "l2" else self.q_norm(q)
+            k = l2norm(k) if self.norm_k == "l2" else self.k_norm(k)
         if self.use_rope:
             seqlen_offset = 0
             if past_key_values is not None and self.layer_idx is not None:
