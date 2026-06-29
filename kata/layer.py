@@ -9,8 +9,11 @@ Differences from FLA LinearAttention:
 
 from typing import TYPE_CHECKING
 
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from fla.layers.utils import get_layer_cache, update_layer_cache
@@ -25,6 +28,7 @@ from fla.ops.linear_attn import (
 from kata.feature_maps import FeatureMap, feature_map_out_dim
 from kata.parallel_kata_attn import (
     parallel_kata_attn,
+    parallel_kata_attn_decay,
     parallel_kata_attn_fwd,
     parallel_kata_attn_sum,
     parallel_kata_attn_sum_fwd_impl,
@@ -49,6 +53,8 @@ class KataAttention(nn.Module):
         spd_num_groups: int = 1,
         spd_use_kernel: bool = False,
         spd_chunk_size: int = 32,
+        use_offset_gate: bool = False,
+        use_decay: bool = False,
         feature_map_eps: float = 1e-6,
         qk_norm: bool = False,
         norm_q: str = "rmsnorm",
@@ -204,8 +210,57 @@ class KataAttention(nn.Module):
 
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
+        # Data-dependent affine offset for the SPD score: A=(a+<q,k>)^2 with
+        # a_ts = sigmoid(a_proj(x_t)) * sigmoid(a_proj(x_s)) in [0,1]. Implemented
+        # by appending the (scaled) gate as an extra coordinate per group + zero-pad
+        # to a multiple of 16, so the existing squared-dot kernel computes the offset
+        # with no kernel change; autograd flows the gate gradient back to a_proj.
+        self.use_offset_gate = use_offset_gate
+        if use_offset_gate:
+            if feature_map not in ("kata_quadratic", "kata_quadratic_sum"):
+                raise ValueError(
+                    "use_offset_gate requires feature_map in "
+                    "{kata_quadratic, kata_quadratic_sum}"
+                )
+            if self.num_kv_groups != 1:
+                raise ValueError("use_offset_gate currently requires MHA (num_kv_heads=num_heads)")
+            self._off_E = self.head_k_dim // spd_num_groups
+            # kernel requires the group dim to be a power of 2; pad to next pow2 > E
+            self._off_Epad = max(16, 1 << self._off_E.bit_length())
+            self._off_scale = 1.0 / math.sqrt(self._off_E)          # = kernel default for orig E
+            self.a_proj = nn.Linear(hidden_size, num_heads, bias=True)
+
+        # Data-dependent GDN-style recency decay: score *= exp(c_t - c_s),
+        # c = cumsum( -exp(A_log)*softplus(dt_proj(x)+dt_bias) ). Soft "replacement".
+        self.use_decay = use_decay
+        if use_decay:
+            if feature_map != "kata_quadratic":
+                raise ValueError("use_decay currently requires feature_map=kata_quadratic (concat)")
+            self.dt_proj = nn.Linear(hidden_size, num_heads, bias=False)
+            A = torch.empty(num_heads).uniform_(0, 16)
+            self.A_log = nn.Parameter(torch.log(A))
+            dt = torch.exp(
+                torch.rand(num_heads) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)
+            ).clamp(min=1e-4)
+            self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))   # inverse softplus
+
         self.norm_q = norm_q
         self.norm_k = norm_k
+
+    def _augment_offset(self, q, k, off):
+        """Per-token, per-head additive offset: append off_t to each group of q and a
+        constant 1 to each group of k (zero-pad the group to a power-of-2 dim), so the
+        squared-dot kernel yields (<q_i,k_i> + off_t)^2 per group. off: (B,T,H)."""
+        B, T, H, _ = q.shape
+        M, E, Ep = self.spd_num_groups, self._off_E, self._off_Epad
+
+        def _pack(x, col):                      # col: (B,T,H) -> one coord per group
+            xg = x.view(B, T, H, M, E)
+            c = col[..., None, None].expand(B, T, H, M, 1).to(x.dtype)
+            z = x.new_zeros(B, T, H, M, Ep - E - 1)
+            return torch.cat([xg, c, z], dim=-1).reshape(B, T, H, M * Ep)
+
+        return _pack(q, off), _pack(k, torch.ones_like(off))
 
     def forward(
         self,
@@ -327,44 +382,58 @@ class KataAttention(nn.Module):
             # `kata_quadratic_sum` -> sum-SPD score   Sum_{i,j} (q_i.k_j)^2
             #                         (matches paper KATA-SPD-4 math).
             is_sum = self.feature_map_name == "kata_quadratic_sum"
+            # data-dependent affine offset (sign/suppression): append sigmoid gate
+            # as an extra group coordinate; score becomes (<q,k> + g_t g_s)^2.
+            q_in, k_in, scale_in = q, k, None
+            if self.use_offset_gate:
+                off = torch.sigmoid(self.a_proj(hidden_states))    # (B,T,H) in [0,1], per token/head
+                q_in, k_in = self._augment_offset(q, k, off)
+                scale_in = self._off_scale
             grad_on = torch.is_grad_enabled() and any(
-                t.requires_grad for t in (q, k, v)
+                t.requires_grad for t in (q_in, k_in, v)
             )
-            if grad_on:
+            if self.use_decay:
+                dt = F.softplus(self.dt_proj(hidden_states) + self.dt_bias)   # (B,T,H) >0
+                c = (-self.A_log.float().exp() * dt.float()).cumsum(dim=1).contiguous()
+                o = parallel_kata_attn_decay(
+                    q_in, k_in, v, c,
+                    num_groups=self.spd_num_groups, scale=scale_in,
+                )
+            elif grad_on:
                 if is_sum:
                     o = parallel_kata_attn_sum(
-                        q,
-                        k,
+                        q_in,
+                        k_in,
                         v,
                         num_groups=self.spd_num_groups,
-                        scale=None,
+                        scale=scale_in,
                     )
                 else:
                     o = parallel_kata_attn(
-                        q,
-                        k,
+                        q_in,
+                        k_in,
                         v,
                         num_groups=self.spd_num_groups,
-                        scale=None,
+                        scale=scale_in,
                     )
             else:
                 if is_sum:
                     o, _ = parallel_kata_attn_sum_fwd_impl(
-                        q,
-                        k,
+                        q_in,
+                        k_in,
                         v,
                         self.spd_num_groups,
-                        None,
+                        scale_in,
                         64,
                         64,
                     )
                 else:
                     o, _ = parallel_kata_attn_fwd(
-                        q,
-                        k,
+                        q_in,
+                        k_in,
                         v,
                         num_groups=self.spd_num_groups,
-                        scale=None,
+                        scale=scale_in,
                     )
             final_state = None
         else:

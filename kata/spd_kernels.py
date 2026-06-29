@@ -303,6 +303,7 @@ def spd_chunk_output_kernel(
     d_v: tl.constexpr,
     Q_PER_G: tl.constexpr,
     EPS: tl.constexpr,
+    NORMALIZE: tl.constexpr,
 ):
     """Output for one chunk = inter (psi(Q) @ S_prefix) + intra (causal).
     Inner: loop over M groups for the per-group (q.k)^2 contribution; outer
@@ -374,7 +375,9 @@ def spd_chunk_output_kernel(
     v_off = b * T * H * d_v + t_idx[:, None] * H * d_v + h * d_v + offs_dv_full[None, :]
     V_tile = tl.load(V_addr + v_off).to(tl.float32)
     O_intra = tl.dot(A_masked, V_tile, allow_tf32=False)
-    O = (O_inter + O_intra) / D[:, None]
+    O = O_inter + O_intra
+    if NORMALIZE:
+        O = O / D[:, None]      # sum-score normalization (off for GDN-style scaling)
 
     tl.store(O_addr + v_off, O.to(O_addr.dtype.element_ty))
 
@@ -432,6 +435,7 @@ def chunk_kata_spd_fwd(
     initial_state: tuple[torch.Tensor, torch.Tensor] | None = None,
     output_final_state: bool = False,
     scan_mode: str = "tree",
+    normalize: bool = True,
 ):
     """SPD chunked linear-attention forward.
 
@@ -455,6 +459,7 @@ def chunk_kata_spd_fwd(
     if ME % num_groups != 0:
         raise ValueError(f"head_k_dim ME={ME} not divisible by num_groups={num_groups}")
     E = ME // num_groups
+    M = num_groups
     if E < 16:
         raise ValueError(f"E = head_k/M = {E} < 16; raise head_k or lower M")
     C = chunk_size
@@ -539,6 +544,7 @@ def chunk_kata_spd_fwd(
         d_v=d_v,
         Q_PER_G=Q_PER_G,
         EPS=eps,
+        NORMALIZE=normalize,
     )
 
     final_state = None

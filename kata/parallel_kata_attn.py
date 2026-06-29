@@ -106,6 +106,7 @@ def parallel_kata_attn_fwd_kernel(
     v,                  # (B, T, H, V)  bf16
     o,                  # (B, T, HQ, V) bf16
     den,                # (B, T, HQ)    fp32 — denominator Sum_s A[t,s], saved for bwd
+    c,                  # (B, T, HQ)    fp32 — cumulative log-decay (or unused)
     scale,              # softmax_scale (applied to qk *before* squaring)
     T,
     H: tl.constexpr,
@@ -118,6 +119,7 @@ def parallel_kata_attn_fwd_kernel(
     E: tl.constexpr,    # = K_d / M
     BT: tl.constexpr,   # query-block rows  (autotuned)
     BS: tl.constexpr,   # key-block rows    (autotuned)
+    HAS_DECAY: tl.constexpr,   # multiply score by exp(c_t - c_s) (GDN-style decay)
 ):
     i_v = tl.program_id(0)
     i_t = tl.program_id(1)
@@ -141,6 +143,12 @@ def parallel_kata_attn_fwd_kernel(
 
     o_q = i_t * BT + tl.arange(0, BT)
 
+    if HAS_DECAY:
+        p_cq = tl.make_block_ptr(
+            c + bos * HQ + i_hq, (T,), (HQ,), (i_t * BT,), (BT,), (0,),
+        )
+        b_cq = tl.load(p_cq, boundary_check=(0,))      # (BT,) cumulative decay at query rows
+
     # Phase 1: strictly earlier key blocks (no causal mask needed)
     for i_s in range(0, i_t * BT, BS):
         b_s = tl.zeros([BT, BS], dtype=tl.float32)
@@ -161,6 +169,11 @@ def parallel_kata_attn_fwd_kernel(
         o_k = i_s + tl.arange(0, BS)
         m_k = o_k < T
         b_s = tl.where(m_k[None, :], b_s, 0.0)
+
+        if HAS_DECAY:
+            p_cs = tl.make_block_ptr(c + bos * HQ + i_hq, (T,), (HQ,), (i_s,), (BS,), (0,))
+            b_cs = tl.load(p_cs, boundary_check=(0,))
+            b_s = b_s * tl.exp(tl.minimum(b_cq[:, None] - b_cs[None, :], 0.0))
 
         p_v = tl.make_block_ptr(
             v + (bos * H + i_h) * V_d, (T, V_d), (H * V_d, 1),
@@ -192,6 +205,11 @@ def parallel_kata_attn_fwd_kernel(
         m_k = o_k < T
         m_s = (o_q[:, None] >= o_k[None, :]) & m_k[None, :]
         b_s = tl.where(m_s, b_s, 0.0)
+
+        if HAS_DECAY:
+            p_cs = tl.make_block_ptr(c + bos * HQ + i_hq, (T,), (HQ,), (i_s,), (BS,), (0,))
+            b_cs = tl.load(p_cs, boundary_check=(0,))
+            b_s = b_s * tl.exp(tl.minimum(b_cq[:, None] - b_cs[None, :], 0.0))
 
         p_v = tl.make_block_ptr(
             v + (bos * H + i_h) * V_d, (T, V_d), (H * V_d, 1),
@@ -474,8 +492,12 @@ def parallel_kata_attn_fwd_impl(
     scale: float,
     BT: int,
     BS: int,
+    c: torch.Tensor = None,
 ):
     """Quadratic kata-attention forward (causal). Returns (o, den).
+
+    c : optional (B, T, HQ) fp32 cumulative log-decay; if given the score is
+        multiplied by exp(c_t - c_s) (GDN-style recency decay).
 
     o   : (B, T, HQ, V_d) same dtype as v
     den : (B, T, HQ) fp32 — Sum_{s<=t} <psi(q_t), psi(k_s)>, saved for bwd
@@ -505,18 +527,75 @@ def parallel_kata_attn_fwd_impl(
         B, T, HQ, V_d, device=dev, dtype=v.dtype,
     )
     den = torch.empty(B, T, HQ, device=dev, dtype=torch.float32)
+    has_decay = c is not None
+    c_arg = c.contiguous() if has_decay else den   # dummy when unused (not read)
 
     # BT is autotuned: pass grid as a meta-aware lambda.
     grid = lambda meta: (NV, triton.cdiv(T, meta["BT"]), B * HQ)
     parallel_kata_attn_fwd_kernel[grid](
-        q, k, v, o, den,
+        q, k, v, o, den, c_arg,
         scale, T,
         H=H, HQ=HQ, G=G,
         K_d=K_d, V_d=V_d,
         BV=BV,
         M=M, E=E,
+        HAS_DECAY=has_decay,
     )
     return o, den
+
+
+def _kata_decay_ref(q, k, v, c, num_groups, scale):
+    """Differentiable PyTorch reference for the decayed normalized SPD attention
+    (matches the Triton fwd: score (scale*q.k)^2 per group, * exp(min(c_t-c_s,0)),
+    causal, sum-normalized). Materializes T^2 -- used only in the bwd recompute."""
+    B, T, H, Kd = q.shape
+    M = num_groups
+    E = Kd // M
+    qg = q.view(B, T, H, M, E)
+    kg = k.view(B, T, H, M, E)
+    qk = torch.einsum("bthme,bshme->bhtsm", qg, kg)
+    A = ((scale * qk) ** 2).sum(-1)                                   # (B,H,T,T)
+    cH = c.transpose(1, 2)                                            # (B,H,T)
+    dec = torch.exp(torch.clamp(cH[:, :, :, None] - cH[:, :, None, :], max=0.0))
+    tri = torch.tril(torch.ones(T, T, device=q.device, dtype=A.dtype))
+    A = A * dec * tri
+    o = torch.einsum("bhts,bshd->bthd", A, v) / (
+        A.sum(-1).transpose(1, 2)[..., None] + 1e-20
+    )
+    return o
+
+
+class _KataDecayFunction(torch.autograd.Function):
+    """Triton forward (fast) + autograd-recompute backward (correct, incl. dc).
+    The Triton decay backward is a perf TODO; this is correctness-complete."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, c, num_groups, scale):
+        if scale is None:
+            scale = 1.0 / math.sqrt(q.shape[-1] // num_groups)
+        o, _ = parallel_kata_attn_fwd_impl(q, k, v, num_groups, scale, 64, 64, c=c)
+        ctx.save_for_backward(q, k, v, c)
+        ctx.num_groups, ctx.scale = num_groups, scale
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, c = ctx.saved_tensors
+        with torch.enable_grad():
+            qd = q.detach().float().requires_grad_(True)
+            kd = k.detach().float().requires_grad_(True)
+            vd = v.detach().float().requires_grad_(True)
+            cd = c.detach().float().requires_grad_(True)
+            o = _kata_decay_ref(qd, kd, vd, cd, ctx.num_groups, ctx.scale)
+            dq, dk, dv, dc = torch.autograd.grad(o, [qd, kd, vd, cd], do.float())
+        return (dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype),
+                dc.to(c.dtype), None, None)
+
+
+def parallel_kata_attn_decay(q, k, v, c, num_groups=2, scale=None):
+    """Decayed SPD attention: o_t = sum_{s<=t} exp(c_t-c_s)(q.k)^2 v_s / sum(...).
+    c: (B,T,HQ) fp32 cumulative log-decay. Triton fwd + autograd-recompute bwd."""
+    return _KataDecayFunction.apply(q, k, v, c, num_groups, scale)
 
 
 def parallel_kata_attn_fwd(q, k, v, num_groups=4, scale=None, BT=64, BS=64):

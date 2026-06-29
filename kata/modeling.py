@@ -66,6 +66,8 @@ class KataBlock(GradientCheckpointingLayer):
                 spd_num_groups=config.spd_num_groups,
                 spd_use_kernel=config.spd_use_kernel,
                 spd_chunk_size=config.spd_chunk_size,
+                use_offset_gate=config.use_offset_gate,
+                use_decay=config.use_decay,
                 feature_map_eps=config.feature_map_eps,
                 qk_norm=config.qk_norm,
                 norm_q=config.norm_q,
