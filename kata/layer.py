@@ -33,7 +33,6 @@ from kata.parallel_kata_attn import (
     parallel_kata_attn_sum,
     parallel_kata_attn_sum_fwd_impl,
 )
-from kata.spd_kernels import chunk_kata_spd
 
 if TYPE_CHECKING:
     from fla.models.utils import Cache
@@ -107,6 +106,12 @@ class KataAttention(nn.Module):
         #   "rmsnorm" -> transformer-style RMSNorm (learnable scale)
         #   "l2"      -> GDN-style parameter-free l2-norm (x/||x||): q.k in [-1,1] so
         #               the SPD square (q.k)^2 stays in [0,1] (well-conditioned).
+        # Backward-compat: pre-API configs passed bool norm_q/norm_k; qk_norm now
+        # gates whether they are used, so coerce any bool to a valid type string.
+        if isinstance(norm_q, bool):
+            norm_q = "rmsnorm"
+        if isinstance(norm_k, bool):
+            norm_k = "rmsnorm"
         for _nm, _v in (("norm_q", norm_q), ("norm_k", norm_k)):
             if _v not in ("rmsnorm", "l2"):
                 raise ValueError(f"{_nm} must be 'rmsnorm' or 'l2', got {_v!r}")
@@ -143,21 +148,10 @@ class KataAttention(nn.Module):
         self.spd_chunk_size = spd_chunk_size
 
         if spd_use_kernel:
-            if feature_map != "spd_concat":
-                raise ValueError(
-                    'spd_use_kernel requires feature_map="spd_concat"'
-                )
-            if self.head_k_dim % spd_num_groups != 0:
-                raise ValueError(
-                    f"head_k_dim {self.head_k_dim} not divisible by "
-                    f"spd_num_groups {spd_num_groups}",
-                )
-            E_per_group = self.head_k_dim // spd_num_groups
-            if E_per_group < 16:
-                raise ValueError(
-                    f"E_per_group {E_per_group} < 16; lower spd_num_groups or "
-                    f"raise head_k_dim",
-                )
+            raise NotImplementedError(
+                "spd_use_kernel (the chunk_kata_spd path) was removed; use "
+                "feature_map='kata_quadratic' (parallel_kata_attn) instead."
+            )
 
         self.feature_map = FeatureMap(
             name=feature_map,
@@ -354,29 +348,10 @@ class KataAttention(nn.Module):
                     q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen
                 )
 
-        # SPD kernel path: skip psi materialization, hand raw projections to
-        # the on-the-fly Triton kernel. Only valid for chunk mode (no varlen,
-        # no caching support yet — those use the pre-materialize fallback).
         recurrent_state = (
             last_state["recurrent_state"] if last_state is not None else None
         )
-        use_kernel = (
-            self.spd_use_kernel
-            and self.feature_map_name == "spd_concat"
-            and mode == "chunk"
-            and not use_cache
-            and recurrent_state is None
-        )
-        if use_kernel:
-            o = chunk_kata_spd(
-                q,
-                k,
-                v,
-                chunk_size=self.spd_chunk_size,
-                num_groups=self.spd_num_groups,
-            )
-            final_state = None
-        elif self.feature_map_name in ("kata_quadratic", "kata_quadratic_sum"):
+        if self.feature_map_name in ("kata_quadratic", "kata_quadratic_sum"):
             # FlashAttention-style quadratic kata; psi never materialized.
             # `kata_quadratic`     -> concat-SPD score Sum_i (q_i.k_i)^2
             # `kata_quadratic_sum` -> sum-SPD score   Sum_{i,j} (q_i.k_j)^2

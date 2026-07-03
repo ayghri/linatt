@@ -1,0 +1,33 @@
+name: kata_cat2_hybrid_340m
+# Hybrid kata: every 4th layer is full softmax attention, the rest are kata-SPD
+# (concat M=2, RoPE, RMSNorm qk-norm). attn_freq=4 -> layers [3,7,11,15,19,23].
+hf_kwargs:
+  model_type: kata
+  hidden_size: 1024
+  num_hidden_layers: 24
+  num_heads: 16
+  num_kv_heads: 16
+  expand_k: 1.0
+  expand_v: 1.0
+  feature_map: kata_quadratic
+  spd_num_groups: 2
+  spd_use_kernel: false
+  qk_norm: true
+  norm_q: rmsnorm
+  norm_k: rmsnorm
+  use_short_conv: false
+  use_rope: true
+  rope_theta: 10000.0
+  rope_group: false
+  attn_freq: 4                    # every 4th layer = full attention (build_model expands)
+  max_position_embeddings: 2048
+  hidden_ratio: 4
+  hidden_act: swish
+  norm_eps: 1.0e-6
+  tie_word_embeddings: true
+  fuse_norm: true
+  fuse_swiglu: true
+  fuse_cross_entropy: true
+  vocab_size: 32000
+  bos_token_id: 1
+  eos_token_id: 2

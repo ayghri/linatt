@@ -56,20 +56,34 @@ def _grad_group(name):
         return "o_proj"
     if "q_norm" in n or "k_norm" in n:
         return "qk_norm"
-    if "a_proj" in n or "b_proj" in n or "g_proj" in n or "a_log" in n or "dt_bias" in n:
-        return "gdn_gate"       # GDN decay / beta / output gate
+    if (
+        "a_proj" in n
+        or "b_proj" in n
+        or "g_proj" in n
+        or "a_log" in n
+        or "dt_bias" in n
+    ):
+        return "gdn_gate"  # GDN decay / beta / output gate
     if "embeddings" in n or "embed" in n:
         return "embed"
     if "lm_head" in n:
         return "head"
-    if "mlp" in n or "gate_proj" in n or "up_proj" in n or "down_proj" in n or "swiglu" in n:
+    if (
+        "mlp" in n
+        or "gate_proj" in n
+        or "up_proj" in n
+        or "down_proj" in n
+        or "swiglu" in n
+    ):
         return "mlp"
     if "norm" in n:
         return "norm"
     return "other"
 
 
-def clip_grad_and_group_norms(named_parameters, max_norm, norm_type=2.0, return_groups=True):
+def clip_grad_and_group_norms(
+    named_parameters, max_norm, norm_type=2.0, return_groups=True
+):
     """Drop-in for torch.nn.utils.clip_grad_norm_ that can ALSO return per-module-group
     grad norms -- computing each parameter's grad norm only ONCE (via the same
     torch._foreach_norm the clip uses) and reusing it for both the total-norm clip
@@ -104,6 +118,39 @@ def clip_grad_and_group_norms(named_parameters, max_norm, norm_type=2.0, return_
     return total_norm, {g: math.sqrt(v) for g, v in sq.items()}
 
 
+def build_lr_param_groups(model, weight_decay, lr_mult):
+    """AdamW param groups with per-pattern LR multipliers.
+
+    lr_mult: dict {regex: multiplier} (or list of [regex, multiplier]); the FIRST
+    pattern whose regex matches a parameter's name sets its multiplier, default 1.0.
+    Each group carries `lr_mult`; the scheduler sets group lr = base_lr * lr_mult.
+    e.g. {"q_proj|k_proj|v_proj|o_proj|a_proj|dt_proj|conv1d": 2.0} -> kata attn at 2x,
+    MLP/embeddings stay at base.
+    """
+    import re
+    params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    if not lr_mult:
+        return [{"params": [p for _, p in params], "lr_mult": 1.0,
+                 "weight_decay": weight_decay}]
+    items = lr_mult.items() if isinstance(lr_mult, dict) else lr_mult
+    rules = [(re.compile(pat), float(m)) for pat, m in items]
+    buckets, names = {}, {}
+    for name, p in params:
+        mult = 1.0
+        for rx, m in rules:
+            if rx.search(name):
+                mult = m
+                break
+        buckets.setdefault(mult, []).append(p)
+        names.setdefault(mult, 0)
+        names[mult] += p.numel()
+    groups = [{"params": ps, "lr_mult": mult, "weight_decay": weight_decay}
+              for mult, ps in buckets.items()]
+    print("[lr_mult] groups: " + ", ".join(
+        f"x{mult}: {names[mult]/1e6:.1f}M params" for mult in sorted(buckets)))
+    return groups
+
+
 class WarmedUpScheduler:
     """Linear warmup (min_lr -> peak_lr) then cosine decay back to min_lr,
     where min_lr = min_lr_rate * peak_lr (peak_lr is the configured `lr`)."""
@@ -129,7 +176,7 @@ class WarmedUpScheduler:
     def update(self, t):
         lr = self.get_lr(t)
         for g in self.optimizer.param_groups:
-            g["lr"] = lr
+            g["lr"] = lr * g.get("lr_mult", 1.0)   # per-group LR multiplier
         return lr
 
 
@@ -182,11 +229,16 @@ class DDPLLMPretrainer:
         self.model = DistributedDataParallel(
             model.to(self.device), device_ids=[self.local_rank]
         )
+        lr_mult = tr.get("lr_mult", None)
+        if lr_mult is not None:
+            lr_mult = OmegaConf.to_container(lr_mult, resolve=True)
+        param_groups = build_lr_param_groups(
+            self.model, float(tr.weight_decay), lr_mult
+        )
         self.optimizer = AdamW(
-            self.model.parameters(),
-            lr=float(tr.lr),  # peak; overwritten each step by scheduler
+            param_groups,
+            lr=float(tr.lr),  # peak; overwritten each step by scheduler (x lr_mult)
             betas=tuple(tr.betas),
-            weight_decay=float(tr.weight_decay),
         )
         self.scheduler = WarmedUpScheduler(
             self.optimizer,
@@ -240,11 +292,59 @@ class DDPLLMPretrainer:
             "numpy_rng": np.random.get_state(),
             "python_rng": random.getstate(),
         }
-        torch.save(ckpt, os.path.join(self.save_dir, f"step_{step}.pt"))
-        # stable name so `resume=latest` always finds the newest state.
-        torch.save(ckpt, os.path.join(self.save_dir, "latest.pt"))
-        # human-readable copy of the architecture next to the weights.
-        self.model.module.config.to_json_file(os.path.join(self.save_dir, "config.json"))
+        dst = os.path.join(self.save_dir, f"step_{step}.pt")
+        tmp = dst + ".tmp"
+        # ATOMIC save: write to a temp file, fsync, then rename. A crash or a full
+        # disk mid-write leaves the PREVIOUS checkpoints intact -- never a partial dst.
+        try:
+            with open(tmp, "wb") as f:
+                torch.save(ckpt, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, dst)  # atomic
+        except OSError as e:  # disk full / io error -> do NOT corrupt or abort
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            print(
+                f"[checkpoint] FAILED to save step {step}: {e}. "
+                f"Previous checkpoints are intact; continuing training.",
+                flush=True,
+            )
+            return
+        # latest.pt -> a symlink to the new step file (atomic; avoids a 2nd full-size
+        # copy that was doubling disk usage and filling the volume).
+        link = os.path.join(self.save_dir, "latest.pt")
+        try:
+            ltmp = link + ".tmp"
+            if os.path.lexists(ltmp):
+                os.remove(ltmp)
+            os.symlink(os.path.basename(dst), ltmp)  # relative target
+            os.replace(ltmp, link)
+        except OSError:
+            pass
+        try:  # human-readable arch copy (atomic)
+            ctmp = os.path.join(self.save_dir, "config.json.tmp")
+            self.model.module.config.to_json_file(ctmp)
+            os.replace(ctmp, os.path.join(self.save_dir, "config.json"))
+        except OSError:
+            pass
+        # Prune old step checkpoints to bound disk usage (keep the newest K).
+        keep = int(getattr(self, "keep_last_k", 5))
+        try:
+            steps = sorted(
+                (
+                    p
+                    for p in os.listdir(self.save_dir)
+                    if p.startswith("step_") and p.endswith(".pt")
+                ),
+                key=lambda p: int(p[5:-3]),
+            )
+            for old in steps[:-keep]:
+                os.remove(os.path.join(self.save_dir, old))
+        except (OSError, ValueError):
+            pass
 
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
@@ -321,7 +421,8 @@ class DDPLLMPretrainer:
             # loss_reduced cadence (return_groups=False -> exactly torch's clip cost).
             log_reduced = (step + 1) % self.progress_interval == 0
             grad_norm, group_norms = clip_grad_and_group_norms(
-                self.model.module.named_parameters(), self.max_grad_norm,
+                self.model.module.named_parameters(),
+                self.max_grad_norm,
                 return_groups=log_reduced,
             )
             self.optimizer.step()
@@ -399,28 +500,41 @@ def build_model(cfg):
             with open(cfg_json) as f:
                 saved = json.load(f)
         else:  # older checkpoints embed the config in the .pt instead of config.json
-            saved = torch.load(resume, map_location="cpu", weights_only=False).get("config")
+            saved = torch.load(resume, map_location="cpu", weights_only=False).get(
+                "config"
+            )
     if saved:
-        hf_kwargs = {**hf_kwargs, **saved}   # checkpoint config overrides the named config
-        print(f"[resume] arch = cfg.model.hf_kwargs overridden by saved checkpoint config "
-              f"({resume})")
+        hf_kwargs = {
+            **hf_kwargs,
+            **saved,
+        }  # checkpoint config overrides the named config
+        print(
+            f"[resume] arch = cfg.model.hf_kwargs overridden by saved checkpoint config "
+            f"({resume})"
+        )
+    # Hybrid: attn_freq=F -> every F-th layer is full softmax attention, rest linear.
+    # Model-agnostic (kata + fla GDN both read config.attn = {layers, num_heads}).
+    freq = hf_kwargs.pop("attn_freq", None)
+    if freq and not hf_kwargs.get("attn"):
+        n_layers = hf_kwargs["num_hidden_layers"]
+        attn_layers = [i for i in range(n_layers) if (i + 1) % freq == 0]
+        hf_kwargs["attn"] = {
+            "layers": attn_layers,
+            "num_heads": hf_kwargs.get("attn_num_heads", hf_kwargs["num_heads"]),
+        }
+        print(f"[hybrid] attn_freq={freq} -> full-attention layers {attn_layers}")
+    hf_kwargs.pop("attn_num_heads", None)
     return AutoModelForCausalLM.from_config(AutoConfig.for_model(**hf_kwargs))
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="main.yaml")
 def main(cfg: DictConfig) -> None:
-    # ---- model: fp32 MASTER weights; bf16 compute via autocast in the loop. ----
-    # fla's fused triton kernels (norm/swiglu/(linear-)CE + chunk-scan mixer) are
-    # the optimization; we run them eager (no torch.compile -- Inductor can't
-    # trace them and only fuses un-fused ops, of which fla leaves none).
     model = build_model(cfg)
-    if cfg.train.get("pure_bf16", False):
-        model = model.to(torch.bfloat16)  # A/B control: bf16 master (defective)
-    else:
-        # bf16 residual via embedding-output cast; weights stay fp32 (fp32 master + grad).
-        model.model.embeddings.register_forward_hook(
-            lambda mod, inp, out: out.to(torch.bfloat16)
-        )
+    model = model.to(torch.bfloat16)
+    # make sure embeddings are in bf16 since autocast fp32+bf16 -> fp32
+    model.model.embeddings.register_forward_hook(
+        lambda mod, inp, out: out.to(torch.bfloat16)
+    )
 
     dataset = load_sharded_dataset(cfg.data.save_dir)
 
