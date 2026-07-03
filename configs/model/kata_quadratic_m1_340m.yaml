@@ -1,29 +1,36 @@
 name: kata_quadratic_m1_340m
-# Same as kata_quadratic_340m but with M=1 (no SPD group split).
-# Implicit psi(q) = vec(q q^T) of dim d_head^2 = 4096 at d_head=64,
-# never materialized — the kernel computes A[t,s] = (q[t] . k[s])^2
-# inline as a single dot product per (t,s) block.
-# MQAR sweep showed M=1 reaches 1.000 at K=1024 (beats paper).
+# M=1 analog of kata_cat2_340m: concat-SPD score with a single group (full-head
+# psi(q)=vec(q q^T), score A[t,s]=(q[t].k[s])^2), routed to the parallel_kata_attn
+# flash kernel. Same attention API as kata_cat2 (qk_norm + norm_q/norm_k strings,
+# RoPE); only spd_num_groups (1 vs 2) and the per-layer lr_mult differ.
+
+# Per-layer-type LR (read by train_llm as a default when train.lr_mult is unset):
+# MLP / embeddings / norms use the base lr (train.lr, default 3e-4); attention params
+# (everything matching "attn") get base x 5/3 -> 5e-4. Override via train.lr_mult=...
+lr_mult:
+  attn: 1.6666666666666667
+
 hf_kwargs:
   model_type: kata
   hidden_size: 1024
   num_hidden_layers: 24
   num_heads: 16
+  num_kv_heads: 16
   expand_k: 1.0
   expand_v: 1.0
-  feature_map: kata_quadratic
-  spd_num_groups: 1
-  spd_use_kernel: false
-  feature_map_eps: 1.0e-6
-  norm_q: false
-  norm_k: false
-  use_short_conv: true
-  conv_size: 4
-  conv_bias: false
-  attn_mode: chunk
+  feature_map: kata_quadratic     # concat-SPD score  Sum_i (q_i . k_i)^2
+  spd_num_groups: 1               # M=1 (single group = full-head SPD)
+  spd_use_kernel: false           # routes to parallel_kata_attn flash kernel
+  qk_norm: true                   # master switch for qk normalization
+  norm_q: rmsnorm                 # norm TYPE for q: rmsnorm | l2
+  norm_k: rmsnorm                 # norm TYPE for k
+  use_short_conv: false           # transformer has NO short conv
+  use_rope: true                  # interleaved=True inside KataAttention
+  rope_theta: 10000.0
+  rope_group: false               # full-head interleaved RoPE (per-group was a net negative)
+  max_position_embeddings: 2048
   hidden_ratio: 4
   hidden_act: swish
-  max_position_embeddings: 2048
   norm_eps: 1.0e-6
   tie_word_embeddings: true
   fuse_norm: true

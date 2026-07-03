@@ -186,7 +186,7 @@ class DDPLLMPretrainer:
         self.cfg = cfg
         tr, data = cfg.train, cfg.data
         self.device, self.local_rank, self.rank, self.world_size = init_dist(
-            tr.get("backend", None)
+            tr.get("backend")
         )
 
         # batch_size/GPU is derived from the token budget, not configured directly.
@@ -209,6 +209,7 @@ class DDPLLMPretrainer:
         )
         self.max_grad_norm = float(tr.max_grad_norm)
         self.save_dir = cfg.output_dir
+        self.keep_last_k = int(cfg.get("keep_last_k", 5))  # checkpoints to retain
 
         self.sampler = DistributedSampler(
             dataset,
@@ -229,9 +230,10 @@ class DDPLLMPretrainer:
         self.model = DistributedDataParallel(
             model.to(self.device), device_ids=[self.local_rank]
         )
-        lr_mult = tr.get("lr_mult", None)
-        if lr_mult is not None:
-            lr_mult = OmegaConf.to_container(lr_mult, resolve=True)
+        # per-layer-type LR multipliers: train.lr_mult overrides the model config's
+        # own default (e.g. kata_quadratic_m1_340m -> {attn: 5/3}); as a plain dict.
+        lr_mult = tr.get("lr_mult") or cfg.model.get("lr_mult")
+        lr_mult = OmegaConf.to_container(lr_mult, resolve=True) if lr_mult else None
         param_groups = build_lr_param_groups(
             self.model, float(tr.weight_decay), lr_mult
         )
@@ -250,7 +252,7 @@ class DDPLLMPretrainer:
 
         # ---- resume (optional): null | "latest" | path/to/step_N.pt ----
         self.start_step = 0
-        resume = tr.get("resume", None)
+        resume = tr.get("resume")
         if resume:
             if resume == "latest":
                 resume = os.path.join(self.save_dir, "latest.pt")
@@ -331,17 +333,13 @@ class DDPLLMPretrainer:
         except OSError:
             pass
         # Prune old step checkpoints to bound disk usage (keep the newest K).
-        keep = int(getattr(self, "keep_last_k", 5))
         try:
             steps = sorted(
-                (
-                    p
-                    for p in os.listdir(self.save_dir)
-                    if p.startswith("step_") and p.endswith(".pt")
-                ),
+                (p for p in os.listdir(self.save_dir)
+                 if p.startswith("step_") and p.endswith(".pt")),
                 key=lambda p: int(p[5:-3]),
             )
-            for old in steps[:-keep]:
+            for old in steps[:-self.keep_last_k]:
                 os.remove(os.path.join(self.save_dir, old))
         except (OSError, ValueError):
             pass
@@ -362,6 +360,15 @@ class DDPLLMPretrainer:
                 f"({ckpt.get('tokens_seen', 0)/1e9:.2f}B tokens)"
             )
 
+    def _next_input_ids(self):
+        """Next batch's input_ids on device, cycling the loader at epoch end."""
+        try:
+            batch = next(self._loader)
+        except StopIteration:
+            self._loader = iter(self.dataloader)
+            batch = next(self._loader)
+        return batch["input_ids"].to(self.device, non_blocking=True)
+
     def train(self):
         self.model.train()
         assert self.max_steps <= len(self.dataloader) // self.grad_accum, (
@@ -372,14 +379,14 @@ class DDPLLMPretrainer:
         # Single pass with a fixed epoch -> deterministic order, so skipping
         # start_step*grad_accum microbatches resumes at the exact data position.
         self.sampler.set_epoch(0)
-        loader = iter(self.dataloader)
+        self._loader = iter(self.dataloader)
         if self.start_step > 0:
             for _ in tqdm(
                 range(self.start_step * self.grad_accum),
                 desc="skip seen data",
                 disable=not self.is_main(),
             ):
-                next(loader)
+                next(self._loader)
 
         pbar = tqdm(
             range(self.start_step, self.max_steps),
@@ -398,15 +405,7 @@ class DDPLLMPretrainer:
             step_loss = torch.zeros((), device=self.device)
             for g in range(self.grad_accum):
                 sync = g == self.grad_accum - 1
-                try:
-                    input_ids = next(loader)["input_ids"].to(
-                        self.device, non_blocking=True
-                    )
-                except StopIteration:
-                    loader = iter(self.dataloader)
-                    input_ids = next(loader)["input_ids"].to(
-                        self.device, non_blocking=True
-                    )
+                input_ids = self._next_input_ids()
                 ctx = nullcontext() if sync else self.model.no_sync()
                 with ctx:
                     with torch.autocast(self.device.type, dtype=torch.bfloat16):
@@ -490,7 +489,7 @@ def build_model(cfg):
     no saved config simply use the yaml.
     """
     hf_kwargs = OmegaConf.to_container(cfg.model.hf_kwargs, resolve=True)
-    resume = cfg.train.get("resume", None)
+    resume = cfg.train.get("resume")
     if resume == "latest":
         resume = os.path.join(cfg.output_dir, "latest.pt")
     saved = None
