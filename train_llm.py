@@ -131,23 +131,20 @@ def build_lr_param_groups(model, weight_decay, lr_mult):
     params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     if not lr_mult:
         return [{"params": [p for _, p in params], "lr_mult": 1.0,
-                 "weight_decay": weight_decay}]
-    items = lr_mult.items() if isinstance(lr_mult, dict) else lr_mult
-    rules = [(re.compile(pat), float(m)) for pat, m in items]
-    buckets, names = {}, {}
+                 "weight_decay": weight_decay, "name": "all"}]
+    rules = list(lr_mult.items() if isinstance(lr_mult, dict) else lr_mult)
+    # one named group per pattern (+ a "base" group for unmatched); first match wins.
+    buckets = {"base": (1.0, [])}
+    for pat, m in rules:
+        buckets[pat] = (float(m), [])
     for name, p in params:
-        mult = 1.0
-        for rx, m in rules:
-            if rx.search(name):
-                mult = m
-                break
-        buckets.setdefault(mult, []).append(p)
-        names.setdefault(mult, 0)
-        names[mult] += p.numel()
-    groups = [{"params": ps, "lr_mult": mult, "weight_decay": weight_decay}
-              for mult, ps in buckets.items()]
+        key = next((pat for pat, m in rules if re.search(pat, name)), "base")
+        buckets[key][1].append(p)
+    groups = [{"params": ps, "lr_mult": mult, "weight_decay": weight_decay, "name": key}
+              for key, (mult, ps) in buckets.items() if ps]
     print("[lr_mult] groups: " + ", ".join(
-        f"x{mult}: {names[mult]/1e6:.1f}M params" for mult in sorted(buckets)))
+        f"{g['name']}(x{g['lr_mult']:g}): {sum(p.numel() for p in g['params'])/1e6:.1f}M"
+        for g in groups))
     return groups
 
 
@@ -442,10 +439,13 @@ class DDPLLMPretrainer:
                 metrics = {
                     "loss": step_loss.item(),  # worker-0 local loss, EVERY step
                     "grad_norm": grad_norm.item(),
-                    "lr": lr,
+                    "lr": lr,  # base scheduled lr (warmup+cosine); per-group = lr * lr_mult
                     "tokens_per_sec": tok_per_sec,
                     "tokens_seen": (step + 1) * self.tokens_per_step,
                 }
+                # actual per-group LRs (base x lr_mult) so the REAL rates are visible
+                for grp in self.optimizer.param_groups:
+                    metrics[f"lr/{grp.get('name', 'all')}"] = grp["lr"]
                 if log_reduced:
                     metrics["loss_reduced"] = reduced.item()  # mean across workers
                     metrics.update({f"gradnorm/{g}": v for g, v in group_norms.items()})

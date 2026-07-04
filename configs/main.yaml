@@ -3,7 +3,7 @@
 #   python train.py model=mamba2_200m
 #   python train.py model=delta_net_200m train.lr=4e-4
 defaults:
-  - model: transformers_340m
+  - model: transformer_340m
   - data: slimpajama_15bt
   - train: manual
   - _self_
