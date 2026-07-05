@@ -12,7 +12,6 @@ weight_decay: 0.01
 max_grad_norm: 1.0
 backend: nccl                  # gloo for same-GPU multi-rank smoke tests
 resume: null                   # null | "latest" | path/to/step_N.pt
-pure_bf16: false               # false = fp32 master + bf16 residual; true = bf16 master (A/B)
 
 progress_interval: 50          # log to wandb every N optimizer steps
 # checkpointing cadence = checkpoint_rate (main.yaml) * max_steps

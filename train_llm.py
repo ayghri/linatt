@@ -529,12 +529,15 @@ def build_model(cfg):
 @hydra.main(version_base=None, config_path="configs", config_name="main.yaml")
 def main(cfg: DictConfig) -> None:
     model = build_model(cfg)
-    model = model.to(torch.bfloat16)
-    # make sure embeddings are in bf16 since autocast fp32+bf16 -> fp32
+    # fp32 MASTER weights + fp32 AdamW state; bf16 ONLY for the forward/backward compute.
+    # We do NOT cast the model to bf16 -- that would make AdamW's moments bf16 and drop
+    # weight updates smaller than the weight's bf16 ULP (~0.4%), stalling training.
+    # Instead: keep weights fp32, run the forward under torch.autocast(bf16) (see .train),
+    # and cast the token-embedding OUTPUT to bf16 so the RESIDUAL STREAM is bf16 -- else
+    # hidden states stay fp32 and the whole forward runs in fp32, losing the bf16 speedup.
     model.model.embeddings.register_forward_hook(
         lambda mod, inp, out: out.to(torch.bfloat16)
     )
-
     dataset = load_sharded_dataset(cfg.data.save_dir)
 
     trainer = DDPLLMPretrainer(model, dataset, cfg)
