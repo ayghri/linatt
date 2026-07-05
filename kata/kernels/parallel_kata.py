@@ -1041,23 +1041,21 @@ def parallel_kata_attn_bwd_kernel_dq_M1(
     p_delta = tl.make_block_ptr(
         delta + bos * HQ + i_hq, (T,), (HQ,), (i_t * BT,), (BT,), (0,)
     )
-    b_do = tl.load(p_do, boundary_check=(0, 1)).to(tl.float32)
+    b_do = tl.load(p_do, boundary_check=(0, 1))   # keep bf16 for the do.v tensor-core dot
     b_D = tl.load(p_den, boundary_check=(0,))
     b_delta = tl.load(p_delta, boundary_check=(0,))
     b_D_safe = tl.where(b_D > 0, b_D, 1.0)
 
     b_dq = tl.zeros([BT, K_d], dtype=tl.float32)
     o_q = i_t * BT + tl.arange(0, BT)
+    # q-block is loop-invariant -> load ONCE, not per key-block.
+    p_q = tl.make_block_ptr(
+        q + (bos * HQ + i_hq) * K_d, (T, K_d), (HQ * K_d, 1),
+        (i_t * BT, 0), (BT, K_d), (1, 0),
+    )
+    b_q = tl.load(p_q, boundary_check=(0, 1))
 
     for i_s in range(0, min((i_t + 1) * BT, T), BS):
-        p_q = tl.make_block_ptr(
-            q + (bos * HQ + i_hq) * K_d,
-            (T, K_d),
-            (HQ * K_d, 1),
-            (i_t * BT, 0),
-            (BT, K_d),
-            (1, 0),
-        )
         p_k = tl.make_block_ptr(
             k + (bos * H + i_h) * K_d,
             (K_d, T),
@@ -1066,7 +1064,6 @@ def parallel_kata_attn_bwd_kernel_dq_M1(
             (K_d, BS),
             (0, 1),
         )
-        b_q = tl.load(p_q, boundary_check=(0, 1))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         qk = tl.dot(b_q, b_k) * scale
 
@@ -1078,7 +1075,7 @@ def parallel_kata_attn_bwd_kernel_dq_M1(
             (BV, BS),
             (0, 1),
         )
-        b_v = tl.load(p_v, boundary_check=(0, 1)).to(tl.float32)
+        b_v = tl.load(p_v, boundary_check=(0, 1))   # bf16 -> tensor-core do.v (fp32 accum)
         b_dN_V = tl.dot(b_do, b_v)
         b_dA = (b_dN_V - b_delta[:, None]) / b_D_safe[:, None]
         o_k = i_s + tl.arange(0, BS)
@@ -1134,6 +1131,17 @@ def parallel_kata_attn_bwd_kernel_dkdv_M1(
     o_k = i_s * BS + tl.arange(0, BS)
     t_start = (i_s * BS) // BT
     NT = tl.cdiv(T, BT)
+    # k,v blocks are loop-invariant (fixed i_s) -> load ONCE, bf16 for tensor-core dots.
+    p_k = tl.make_block_ptr(
+        k + (bos * H + i_h) * K_d, (K_d, T), (1, H * K_d),
+        (0, i_s * BS), (K_d, BS), (0, 1),
+    )
+    p_v = tl.make_block_ptr(
+        v + (bos * H + i_h) * V_d, (V_d, T), (1, H * V_d),
+        (0, i_s * BS), (BV, BS), (0, 1),
+    )
+    b_k = tl.load(p_k, boundary_check=(0, 1))
+    b_v = tl.load(p_v, boundary_check=(0, 1))
 
     for i_t in range(t_start, NT):
         p_do = tl.make_block_ptr(
@@ -1150,7 +1158,7 @@ def parallel_kata_attn_bwd_kernel_dkdv_M1(
         p_delta = tl.make_block_ptr(
             delta + bos * HQ + i_hq, (T,), (HQ,), (i_t * BT,), (BT,), (0,)
         )
-        b_do = tl.load(p_do, boundary_check=(0, 1)).to(tl.float32)
+        b_do = tl.load(p_do, boundary_check=(0, 1))   # bf16 for the dv / do.v tensor-core dots
         b_D = tl.load(p_den, boundary_check=(0,))
         b_delta = tl.load(p_delta, boundary_check=(0,))
         b_D_safe = tl.where(b_D > 0, b_D, 1.0)
@@ -1163,16 +1171,7 @@ def parallel_kata_attn_bwd_kernel_dkdv_M1(
             (BT, K_d),
             (1, 0),
         )
-        p_k = tl.make_block_ptr(
-            k + (bos * H + i_h) * K_d,
-            (K_d, T),
-            (1, H * K_d),
-            (0, i_s * BS),
-            (K_d, BS),
-            (0, 1),
-        )
         b_q = tl.load(p_q, boundary_check=(0, 1))
-        b_k = tl.load(p_k, boundary_check=(0, 1))
         qk = tl.dot(b_q, b_k) * scale
         b_A = qk * qk
 
@@ -1182,15 +1181,6 @@ def parallel_kata_attn_bwd_kernel_dkdv_M1(
         b_P = tl.where(causal, b_A / b_D_safe[:, None], 0.0)
         b_dv += tl.dot(tl.trans(b_P.to(b_do.dtype)), b_do)
 
-        p_v = tl.make_block_ptr(
-            v + (bos * H + i_h) * V_d,
-            (V_d, T),
-            (1, H * V_d),
-            (0, i_s * BS),
-            (BV, BS),
-            (0, 1),
-        )
-        b_v = tl.load(p_v, boundary_check=(0, 1)).to(tl.float32)
         b_dN_V = tl.dot(b_do, b_v)
         b_dA = (b_dN_V - b_delta[:, None]) / b_D_safe[:, None]
         b_dA = tl.where(causal, b_dA, 0.0)
