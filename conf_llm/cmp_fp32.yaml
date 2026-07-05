@@ -30,7 +30,6 @@ data:
   cache_path: data/slimpajama_627b/300m/train
 
 train:
-  pure_bf16: false        # fp32 master + bf16 residual
   backend: nccl
   batch_size: 4
   seq_len: 2048

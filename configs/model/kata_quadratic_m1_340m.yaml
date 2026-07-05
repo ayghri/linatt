@@ -8,7 +8,7 @@ name: kata_quadratic_m1_340m
 # MLP / embeddings / norms use the base lr (train.lr, default 3e-4); attention params
 # (everything matching "attn") get base x 5/3 -> 5e-4. Override via train.lr_mult=...
 lr_mult:
-  attn: 1.6666666666666667
+  attn: 1.0
 
 hf_kwargs:
   model_type: kata

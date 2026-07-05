@@ -30,7 +30,6 @@ data:
   cache_path: data/slimpajama_627b/300m/train
 
 train:
-  pure_bf16: true         # bf16 MASTER (defective recipe)
   backend: nccl
   batch_size: 4
   seq_len: 2048
