@@ -18,14 +18,14 @@ from einops import rearrange, repeat
 
 from fla.layers.utils import get_layer_cache, update_layer_cache
 from fla.modules import RMSNorm, RotaryEmbedding, ShortConvolution
-from fla.modules.l2norm import l2norm  # the function (fla.modules.l2norm is the submodule)
+from fla.modules.l2norm import l2norm
 from fla.ops.linear_attn import (
     chunk_linear_attn,
     fused_chunk_linear_attn,
     fused_recurrent_linear_attn,
 )
 
-from kata.feature_maps import FeatureMap, feature_map_out_dim
+from kata.references.feature_maps import FeatureMap, feature_map_out_dim
 from kata.parallel_kata_attn import (
     parallel_kata_attn,
     parallel_kata_attn_decay,
@@ -79,9 +79,7 @@ class KataAttention(nn.Module):
         self.hidden_size = hidden_size
         self.mode = mode
         self.num_heads = num_heads
-        self.num_kv_heads = (
-            num_kv_heads if num_kv_heads is not None else num_heads
-        )
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.key_dim = int(hidden_size * expand_k)
         self.value_dim = int(hidden_size * expand_v)
@@ -164,9 +162,7 @@ class KataAttention(nn.Module):
 
         self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.key_dim_per_group, bias=False)
-        self.v_proj = nn.Linear(
-            hidden_size, self.value_dim_per_group, bias=False
-        )
+        self.v_proj = nn.Linear(hidden_size, self.value_dim_per_group, bias=False)
 
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
@@ -217,11 +213,15 @@ class KataAttention(nn.Module):
                     "{kata_quadratic, kata_quadratic_sum}"
                 )
             if self.num_kv_groups != 1:
-                raise ValueError("use_offset_gate currently requires MHA (num_kv_heads=num_heads)")
+                raise ValueError(
+                    "use_offset_gate currently requires MHA (num_kv_heads=num_heads)"
+                )
             self._off_E = self.head_k_dim // spd_num_groups
             # kernel requires the group dim to be a power of 2; pad to next pow2 > E
             self._off_Epad = max(16, 1 << self._off_E.bit_length())
-            self._off_scale = 1.0 / math.sqrt(self._off_E)          # = kernel default for orig E
+            self._off_scale = 1.0 / math.sqrt(
+                self._off_E
+            )  # = kernel default for orig E
             self.a_proj = nn.Linear(hidden_size, num_heads, bias=True)
 
         # Data-dependent GDN-style recency decay: score *= exp(c_t - c_s),
@@ -229,14 +229,19 @@ class KataAttention(nn.Module):
         self.use_decay = use_decay
         if use_decay:
             if feature_map != "kata_quadratic":
-                raise ValueError("use_decay currently requires feature_map=kata_quadratic (concat)")
+                raise ValueError(
+                    "use_decay currently requires feature_map=kata_quadratic (concat)"
+                )
             self.dt_proj = nn.Linear(hidden_size, num_heads, bias=False)
             A = torch.empty(num_heads).uniform_(0, 16)
             self.A_log = nn.Parameter(torch.log(A))
             dt = torch.exp(
-                torch.rand(num_heads) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)
+                torch.rand(num_heads) * (math.log(0.1) - math.log(0.001))
+                + math.log(0.001)
             ).clamp(min=1e-4)
-            self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))   # inverse softplus
+            self.dt_bias = nn.Parameter(
+                dt + torch.log(-torch.expm1(-dt))
+            )  # inverse softplus
 
         self.norm_q = norm_q
         self.norm_k = norm_k
@@ -248,7 +253,7 @@ class KataAttention(nn.Module):
         B, T, H, _ = q.shape
         M, E, Ep = self.spd_num_groups, self._off_E, self._off_Epad
 
-        def _pack(x, col):                      # col: (B,T,H) -> one coord per group
+        def _pack(x, col):  # col: (B,T,H) -> one coord per group
             xg = x.view(B, T, H, M, E)
             c = col[..., None, None].expand(B, T, H, M, 1).to(x.dtype)
             z = x.new_zeros(B, T, H, M, Ep - E - 1)
@@ -327,9 +332,7 @@ class KataAttention(nn.Module):
             seqlen_offset = 0
             if past_key_values is not None and self.layer_idx is not None:
                 seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
-            max_seqlen = max(
-                q.shape[1] + seqlen_offset, self.max_position_embeddings
-            )
+            max_seqlen = max(q.shape[1] + seqlen_offset, self.max_position_embeddings)
             if self.rope_group:
                 # treat each E-dim group as its own head: (B,T,H,D) -> (B,T,H*M,E),
                 # rotate with RotaryEmbedding(dim=E), reshape back.
@@ -361,18 +364,26 @@ class KataAttention(nn.Module):
             # as an extra group coordinate; score becomes (<q,k> + g_t g_s)^2.
             q_in, k_in, scale_in = q, k, None
             if self.use_offset_gate:
-                off = torch.sigmoid(self.a_proj(hidden_states))    # (B,T,H) in [0,1], per token/head
+                off = torch.sigmoid(
+                    self.a_proj(hidden_states)
+                )  # (B,T,H) in [0,1], per token/head
                 q_in, k_in = self._augment_offset(q, k, off)
                 scale_in = self._off_scale
             grad_on = torch.is_grad_enabled() and any(
                 t.requires_grad for t in (q_in, k_in, v)
             )
             if self.use_decay:
-                dt = F.softplus(self.dt_proj(hidden_states) + self.dt_bias)   # (B,T,H) >0
+                dt = F.softplus(
+                    self.dt_proj(hidden_states) + self.dt_bias
+                )  # (B,T,H) >0
                 c = (-self.A_log.float().exp() * dt.float()).cumsum(dim=1).contiguous()
                 o = parallel_kata_attn_decay(
-                    q_in, k_in, v, c,
-                    num_groups=self.spd_num_groups, scale=scale_in,
+                    q_in,
+                    k_in,
+                    v,
+                    c,
+                    num_groups=self.spd_num_groups,
+                    scale=scale_in,
                 )
             elif grad_on:
                 if is_sum:
