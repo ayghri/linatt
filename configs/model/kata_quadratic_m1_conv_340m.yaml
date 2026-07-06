@@ -1,0 +1,39 @@
+name: kata_quadratic_m1_conv_340m
+# kata_quadratic_m1_340m + SHORT-CONV. Forward order is proj -> short-conv -> qk_norm
+# -> RoPE, so the conv sits just before RoPE (on the projected q/k/v). Unlike the older
+# kataconv variants (conv, no rope), this one uses BOTH short-conv AND RoPE.
+
+lr_mult:
+  attn: 1.0
+
+hf_kwargs:
+  model_type: kata
+  hidden_size: 1024
+  num_hidden_layers: 24
+  num_heads: 16
+  num_kv_heads: 16
+  expand_k: 1.0
+  expand_v: 1.0
+  feature_map: kata_quadratic     # concat-SPD score  Sum_i (q_i . k_i)^2
+  spd_num_groups: 1               # M=1 (single group = full-head SPD)
+  spd_use_kernel: false           # routes to parallel_kata_attn flash kernel
+  qk_norm: true
+  norm_q: rmsnorm
+  norm_k: rmsnorm
+  use_short_conv: true            # <-- short-conv on q/k/v (before qk_norm + RoPE)
+  conv_size: 4
+  conv_bias: false
+  use_rope: true                  # <-- RoPE kept ON (applied after the conv + qk_norm)
+  rope_theta: 10000.0
+  rope_group: false
+  max_position_embeddings: 2048
+  hidden_ratio: 4
+  hidden_act: swish
+  norm_eps: 1.0e-6
+  tie_word_embeddings: true
+  fuse_norm: true
+  fuse_swiglu: true
+  fuse_cross_entropy: true
+  vocab_size: 32000
+  bos_token_id: 1
+  eos_token_id: 2
