@@ -55,68 +55,69 @@ def main(cfg: DictConfig) -> None:
     # Default to the 340m training tokenizer; override with `+tokenizer=...` if different.
     tokenizer = cfg.get("tokenizer", None) or DEFAULT_TOKENIZER
     tasks = list(cfg.eval.get("recall_tasks", RECALL_TASKS))
-    do_all = bool(cfg.eval.get("recall_all", False))
     # RULER/NIAH build synthetic haystacks at these token lengths using the tokenizer,
     # both passed to lm-eval via `metadata` (the GDN paper swept 1K-8K).
     niah_lengths = list(cfg.eval.get("niah_lengths", [1024, 2048, 4096, 8192]))
     metadata = {"tokenizer": tokenizer, "max_seq_lengths": niah_lengths}
 
+    # LATEST checkpoint only -- recall eval is generative/slow and we only care about the
+    # final model.
     paths = sorted(
         glob.glob(os.path.join(output_dir, "step_*.pt")), key=step_of, reverse=True
     )
     if not paths:
         raise SystemExit(f"no step_*.pt in {output_dir}")
-    if not do_all:
-        paths = paths[:1]  # latest checkpoint only (recall eval is generative/slow)
-    print(
-        f"[recall] output_dir={output_dir}  tasks={tasks}  "
-        f"ckpts={[os.path.basename(p) for p in paths]}"
-    )
+    path = paths[0]
 
     import lm_eval
     from lm_eval.models.huggingface import HFLM
 
-    for path in paths:
-        model, tok, step, tokens = load_model(path, device, hf_kwargs, tokenizer)
-        print(f"\n=== {os.path.basename(path)}  step={step}  tokens={tokens/1e9:.2f}B ===")
-        lm = HFLM(pretrained=model, tokenizer=tok, batch_size=batch_size, device=device)
+    model, tok, step, tokens = load_model(path, device, hf_kwargs, tokenizer)
+    print(
+        f"[recall] {os.path.basename(path)}  step={step}  "
+        f"tokens={tokens/1e9:.2f}B  tasks={tasks}"
+    )
+    lm = HFLM(pretrained=model, tokenizer=tok, batch_size=batch_size, device=device)
 
-        out_path = os.path.join(output_dir, f"eval_recall_step_{step}.yaml")
-        results = {"step": step, "tokens_seen": tokens, "tasks": {}}
-        if os.path.exists(out_path):  # resume a partial recall eval
-            try:
-                results = yaml.safe_load(open(out_path)) or results
-                results.setdefault("tasks", {})
-            except Exception:
-                pass
+    out_path = os.path.join(output_dir, f"eval_recall_step_{step}.yaml")
+    results = {"step": step, "tokens_seen": tokens, "tasks": {}}
+    if os.path.exists(out_path):  # resume: reuse finished tasks, RETRY failed ones
+        try:
+            results = yaml.safe_load(open(out_path)) or results
+            results.setdefault("tasks", {})
+        except Exception:
+            pass
+    # create the file UP FRONT so it exists even if every task fails.
+    yaml.safe_dump(results, open(out_path, "w"), sort_keys=False)
+    print(f"  writing -> {out_path}")
 
-        for task in tasks:
-            if task in results["tasks"]:
-                print(f"  {task}: cached, skip")
-                continue
-            try:
-                with torch.inference_mode():
-                    res = lm_eval.simple_evaluate(
-                        model=lm, tasks=[task], batch_size=batch_size,
-                        device=device, metadata=metadata,
-                    )
-                m = to_plain(res["results"].get(task, {}))
-                results["tasks"][task] = m
-                yaml.safe_dump(results, open(out_path, "w"), sort_keys=False)
-                head = (
-                    m.get("acc,none")
-                    or m.get("exact_match,none")
-                    or m.get("contains,none")
-                    or m.get("score,none")
-                    or "done"
+    for task in tasks:
+        prev = results["tasks"].get(task)
+        if prev is not None and "error" not in prev:
+            print(f"  {task}: cached, skip")
+            continue
+        try:
+            with torch.inference_mode():
+                res = lm_eval.simple_evaluate(
+                    model=lm, tasks=[task], batch_size=batch_size,
+                    device=device, metadata=metadata,
                 )
-                print(f"  {task} -> {head}")
-            except Exception as e:
-                print(f"  {task} FAILED: {e}")
+            m = to_plain(res["results"].get(task, {}))
+            head = (
+                m.get("acc,none") or m.get("exact_match,none")
+                or m.get("contains,none") or m.get("score,none") or "done"
+            )
+            print(f"  {task} -> {head}")
+        except Exception as e:
+            m = {"error": str(e)[:300]}
+            print(f"  {task} FAILED: {e}")
+        results["tasks"][task] = m
+        # save after EVERY task (success or failure) -> a crash never loses prior results.
+        yaml.safe_dump(results, open(out_path, "w"), sort_keys=False)
 
-        del model, lm
-        torch.cuda.empty_cache()
-        print(f"  saved -> {out_path}")
+    del model, lm
+    torch.cuda.empty_cache()
+    print(f"  done -> {out_path}")
 
 
 if __name__ == "__main__":
