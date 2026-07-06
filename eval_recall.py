@@ -56,6 +56,10 @@ def main(cfg: DictConfig) -> None:
     tokenizer = cfg.get("tokenizer", None) or DEFAULT_TOKENIZER
     tasks = list(cfg.eval.get("recall_tasks", RECALL_TASKS))
     do_all = bool(cfg.eval.get("recall_all", False))
+    # RULER/NIAH build synthetic haystacks at these token lengths using the tokenizer,
+    # both passed to lm-eval via `metadata` (the GDN paper swept 1K-8K).
+    niah_lengths = list(cfg.eval.get("niah_lengths", [1024, 2048, 4096, 8192]))
+    metadata = {"tokenizer": tokenizer, "max_seq_lengths": niah_lengths}
 
     paths = sorted(
         glob.glob(os.path.join(output_dir, "step_*.pt")), key=step_of, reverse=True
@@ -93,7 +97,8 @@ def main(cfg: DictConfig) -> None:
             try:
                 with torch.inference_mode():
                     res = lm_eval.simple_evaluate(
-                        model=lm, tasks=[task], batch_size=batch_size, device=device
+                        model=lm, tasks=[task], batch_size=batch_size,
+                        device=device, metadata=metadata,
                     )
                 m = to_plain(res["results"].get(task, {}))
                 results["tasks"][task] = m
