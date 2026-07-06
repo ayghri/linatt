@@ -4,8 +4,11 @@ Kept SEPARATE from eval_ckpt.py (the general lm-eval run): this evaluates only t
 recall/retrieval tasks and writes to <output_dir>/eval_recall_step_N.yaml, so recall
 scores never mix with the eval_step_N.yaml commonsense/perplexity numbers.
 
-    python eval_recall.py model=kata_quadratic_m1_340m data=slimpajama_15bt \
-        output_dir=runs/kata_m1_340m
+    python eval_recall.py model=kata_quadratic_m1_340m output_dir=runs/kata_m1_340m
+
+Only the model config is needed. The tokenizer defaults to the 340m training tokenizer
+(TinyLlama/TinyLlama_v1.1); override with `+tokenizer=...` for a differently-trained model.
+No data config is required (recall datasets come from lm-eval, not the training shards).
 
 Suite (matches the GDN paper):
   RULER S-NIAH-1/2/3     -> niah_single_1/2/3    (passkey / number / uuid, generative)
@@ -30,6 +33,8 @@ import fla  # noqa: F401  -- registers fla model_types
 import fla_patches  # noqa: F401  -- kata + SDPA shim
 from eval_ckpt import load_model, step_of, to_plain
 
+DEFAULT_TOKENIZER = "TinyLlama/TinyLlama_v1.1"   # the tokenizer the 340m models trained with
+
 RECALL_TASKS = [
     # RULER single needle-in-a-haystack  (= GDN S-NIAH-1/2/3)
     "niah_single_1", "niah_single_2", "niah_single_3",
@@ -46,7 +51,9 @@ def main(cfg: DictConfig) -> None:
     batch_size = int(cfg.eval.batch_size)
     device = cfg.eval.get("device", "cuda:0")
     hf_kwargs = OmegaConf.to_container(cfg.model.hf_kwargs, resolve=True)
-    tokenizer = cfg.data.tokenizer
+    # recall datasets come from lm-eval, NOT our training data -> no data config needed.
+    # Default to the 340m training tokenizer; override with `+tokenizer=...` if different.
+    tokenizer = cfg.get("tokenizer", None) or DEFAULT_TOKENIZER
     tasks = list(cfg.eval.get("recall_tasks", RECALL_TASKS))
     do_all = bool(cfg.eval.get("recall_all", False))
 
