@@ -10,15 +10,14 @@ Only the model config is needed. The tokenizer defaults to the 340m training tok
 (TinyLlama/TinyLlama_v1.1); override with `+tokenizer=...` for a differently-trained model.
 No data config is required (recall datasets come from lm-eval, not the training shards).
 
-Suite (matches the GDN paper):
-  RULER S-NIAH-1/2/3     -> niah_single_1/2/3    (passkey / number / uuid, generative)
-  MK-NIAH (GDN-2)        -> niah_multikey_1, niah_multivalue, niah_multiquery
-  recall-intensive       -> swde, fda, squad_completion, triviaqa, nq_open, drop (Arora'24b)
+Suite: the Arora'24b (Based) cloze/completion recall tasks -- swde, fda, squad_completion.
+They use next-word-prediction formatting, so they work on BASE (non-instruction-tuned)
+models, matching the GDN paper's setup. NIAH/RULER and the standard triviaqa/nq/drop are
+QA/instruction-format -> ~0 on base models, so they are NOT in the default set; add cloze
+versions later, or override with eval.recall_tasks=[...].
 
-Requires `pip install wonderwords nltk` (NIAH generators). By default evals the LATEST
-checkpoint only (recall tasks are generative/slow); set `+eval.recall_all=true` for all.
-Override the task list with `eval.recall_tasks=[...]`; set NIAH lengths with e.g.
-`+metadata.max_seq_lengths=[1024,2048,4096,8192]`.
+Evaluates only the LATEST checkpoint, writing each task's result to disk as it finishes
+(a crash never loses prior tasks; a re-run retries only the missing/failed ones).
 """
 
 import glob
@@ -35,14 +34,12 @@ from eval_ckpt import load_model, step_of, to_plain
 
 DEFAULT_TOKENIZER = "TinyLlama/TinyLlama_v1.1"   # the tokenizer the 340m models trained with
 
-RECALL_TASKS = [
-    # RULER single needle-in-a-haystack  (= GDN S-NIAH-1/2/3)
-    "niah_single_1", "niah_single_2", "niah_single_3",
-    # multi-key / multi-value / multi-query NIAH  (GDN-2)
-    "niah_multikey_1", "niah_multivalue", "niah_multiquery",
-    # recall-intensive real-world  (Arora'24b / Based)
-    "swde", "fda", "squad_completion", "triviaqa", "nq_open", "drop",
-]
+# Arora'24b (Based) cloze/completion recall tasks: next-word-prediction formatting that
+# works on BASE (non-instruction-tuned) models, matching the GDN paper's setup. These are
+# the only lm-eval recall tasks in that format. NIAH (RULER, QA-style) and the standard
+# triviaqa/nq_open/drop are instruction/QA-format -> ~0 on base models; add cloze versions
+# of those later (override with eval.recall_tasks=[...]).
+RECALL_TASKS = ["swde", "fda", "squad_completion"]
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="main.yaml")
