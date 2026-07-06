@@ -39,7 +39,15 @@ DEFAULT_TOKENIZER = "TinyLlama/TinyLlama_v1.1"   # the tokenizer the 340m models
 # the only lm-eval recall tasks in that format. NIAH (RULER, QA-style) and the standard
 # triviaqa/nq_open/drop are instruction/QA-format -> ~0 on base models; add cloze versions
 # of those later (override with eval.recall_tasks=[...]).
-RECALL_TASKS = ["swde", "fda", "squad_completion"]
+# GDN paper's recall suite: SWDE / SQD / FDA / TQA / NQ / Drop.
+#   swde, fda, squad_completion (=SQD), drop -> in-context (answer lives in the context);
+#       swde/fda/squad use Arora'24b cloze formatting, base-model friendly.
+#   triviaqa (=TQA), nq_open (=NQ)           -> WARNING: lm-eval ships the CLOSED-BOOK
+#       versions (question only, NO passage). They test PARAMETRIC memory, not in-context
+#       recall, so expect low/uninformative numbers at 340M. Included for paper parity;
+#       to truly match the paper's TQA/NQ, swap in the Arora'24b in-context versions
+#       (passage + cloze query) from the Based repo.
+RECALL_TASKS = ["swde", "fda", "squad_completion", "drop", "triviaqa", "nq_open"]
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="main.yaml")
@@ -70,19 +78,19 @@ def main(cfg: DictConfig) -> None:
     from lm_eval.models.huggingface import HFLM
 
     model, tok, step, tokens = load_model(path, device, hf_kwargs, tokenizer)
-    # KATA M1 (parallel_kata_attn) caches conv/RoPE state but NOT the attention K/V, so HF's
+    # KATA (parallel_kata_attn) caches conv/RoPE state but NOT the attention K/V, so HF's
     # incremental decode has each new token attend only to itself -> wrong generation -> 0.0
-    # on every generative task. HFLM hardcodes use_cache=True, so wrap generate() to force
-    # use_cache=False: each step re-attends over the whole sequence (correct, ~O(T^2)/step
-    # slower). Remove once the SPD attention gets a real KV cache.
-    _orig_generate = model.generate
-    def _full_recompute_generate(*a, **kw):
-        kw["use_cache"] = False
-        return _orig_generate(*a, **kw)
-    model.generate = _full_recompute_generate
+    # on every generative task. Force full recompute for KATA only (correct, ~O(T^2)/step
+    # slower); GDN/transformer cache correctly on transformers 4.57. HFLM hardcodes
+    # use_cache=True and spreads gen_kwargs after it, so we wrap generate() rather than pass
+    # a kwarg. Remove once the SPD attention gets a real KV cache.
+    no_cache = getattr(model.config, "model_type", "") == "kata"
+    if no_cache:
+        _orig_generate = model.generate
+        model.generate = lambda *a, **kw: _orig_generate(*a, **{**kw, "use_cache": False})
     print(
-        f"[recall] {os.path.basename(path)}  step={step}  "
-        f"tokens={tokens/1e9:.2f}B  tasks={tasks}  (use_cache=False: no attn KV-cache)"
+        f"[recall] {os.path.basename(path)}  step={step}  tokens={tokens/1e9:.2f}B  "
+        f"tasks={tasks}{'  (KATA: use_cache=False, no attn KV-cache)' if no_cache else ''}"
     )
     lm = HFLM(pretrained=model, tokenizer=tok, batch_size=batch_size, device=device)
 
