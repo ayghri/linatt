@@ -153,7 +153,7 @@ class KataAttention(nn.Module):
 
         self.feature_map = FeatureMap(
             name=feature_map,
-            num_groups=spd_num_groups,
+            num_splits=spd_num_groups,
             eps=feature_map_eps,
         )
         self.head_q_dim = feature_map_out_dim(

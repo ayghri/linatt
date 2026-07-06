@@ -43,12 +43,12 @@ def lorentz(x: torch.Tensor) -> torch.Tensor:
     return torch.cat([head, norm * (1.0 + tail * tail)], dim=-1)
 
 
-def spd_concat(x: torch.Tensor, num_groups: int) -> torch.Tensor:
+def spd_concat(x: torch.Tensor, num_splits: int) -> torch.Tensor:
     """Concatenated SPD one-rank feature map.
 
     Args:
-        x: (..., d). d must be divisible by num_groups.
-        num_groups: M. groups have dim E = d / M.
+        x: (..., d). d must be divisible by num_splits.
+        num_splits: M. groups have dim E = d / M.
 
     Returns:
         (..., M * E*(E+1)//2). For each group g of shape (E,):
@@ -57,17 +57,17 @@ def spd_concat(x: torch.Tensor, num_groups: int) -> torch.Tensor:
         The sqrt(2) on off-diagonals matches <psi(g), psi(h)> = <g, h>**2.
     """
     *prefix, d = x.shape
-    if d % num_groups != 0:
+    if d % num_splits != 0:
         raise ValueError(
-            f"x last dim {d} not divisible by num_groups {num_groups}"
+            f"x last dim {d} not divisible by num_splits {num_splits}"
         )
-    e = d // num_groups
-    g = x.view(*prefix, num_groups, e)
+    e = d // num_splits
+    g = x.view(*prefix, num_splits, e)
 
     diag = g * g  # (..., M, E)
 
     if e == 1:
-        return diag.reshape(*prefix, num_groups * e)
+        return diag.reshape(*prefix, num_splits * e)
 
     # off-diag: outer product, then take strict lower-tri, scaled by sqrt(2).
     outer = g.unsqueeze(-1) * g.unsqueeze(-2)  # (..., M, E, E)
@@ -75,10 +75,10 @@ def spd_concat(x: torch.Tensor, num_groups: int) -> torch.Tensor:
     off = outer[..., ii, jj] * math.sqrt(2.0)  # (..., M, E*(E-1)/2)
 
     packed = torch.cat([diag, off], dim=-1)  # (..., M, E*(E+1)/2)
-    return packed.reshape(*prefix, num_groups * (e * (e + 1) // 2))
+    return packed.reshape(*prefix, num_splits * (e * (e + 1) // 2))
 
 
-def spd_full(x: torch.Tensor, num_groups: int) -> torch.Tensor:
+def spd_full(x: torch.Tensor, num_splits: int) -> torch.Tensor:
     """Full outer-product SPD feature map (no sqrt(2) packing).
 
     Output dim per group is E² (vs E·(E+1)/2 for packed). Wasteful by 2x but
@@ -89,17 +89,17 @@ def spd_full(x: torch.Tensor, num_groups: int) -> torch.Tensor:
     matching the packed form's inner product.
     """
     *prefix, d = x.shape
-    if d % num_groups != 0:
-        raise ValueError(f"d={d} not divisible by M={num_groups}")
-    e = d // num_groups
-    g = x.view(*prefix, num_groups, e)
+    if d % num_splits != 0:
+        raise ValueError(f"d={d} not divisible by M={num_splits}")
+    e = d // num_splits
+    g = x.view(*prefix, num_splits, e)
     out = (g.unsqueeze(-1) * g.unsqueeze(-2)).reshape(
-        *prefix, num_groups * e * e
+        *prefix, num_splits * e * e
     )
     return out
 
 
-def spd_sum(x: torch.Tensor, num_groups: int) -> torch.Tensor:
+def spd_sum(x: torch.Tensor, num_splits: int) -> torch.Tensor:
     """Multi-group SPD with summed outer products, FULL E×E storage.
 
     Split x in R^d into M groups of E = d/M. Return the flattened
@@ -110,15 +110,15 @@ def spd_sum(x: torch.Tensor, num_groups: int) -> torch.Tensor:
         <psi(x), psi(y)> = Sum_{i,j} (g_i · h_j)²
     """
     *prefix, d = x.shape
-    if d % num_groups != 0:
-        raise ValueError(f"d={d} not divisible by M={num_groups}")
-    e = d // num_groups
-    g = x.view(*prefix, num_groups, e)
+    if d % num_splits != 0:
+        raise ValueError(f"d={d} not divisible by M={num_splits}")
+    e = d // num_splits
+    g = x.view(*prefix, num_splits, e)
     out = torch.einsum("...mi,...mj->...ij", g, g)
     return out.reshape(*prefix, e * e)
 
 
-def spd_sum_packed(x: torch.Tensor, num_groups: int) -> torch.Tensor:
+def spd_sum_packed(x: torch.Tensor, num_splits: int) -> torch.Tensor:
     """Multi-group SPD with summed outer products, PACKED storage.
 
     Sum_i g_i g_i^T is symmetric so we keep only the lower triangle:
@@ -131,14 +131,14 @@ def spd_sum_packed(x: torch.Tensor, num_groups: int) -> torch.Tensor:
     For d=128, M=4: q = 32*33/2 = 528 (vs 1024).
 
     Args:
-        x: (..., d). d must be divisible by num_groups.
-        num_groups: M.
+        x: (..., d). d must be divisible by num_splits.
+        num_splits: M.
     """
     *prefix, d = x.shape
-    if d % num_groups != 0:
-        raise ValueError(f"d={d} not divisible by M={num_groups}")
-    e = d // num_groups
-    g = x.view(*prefix, num_groups, e)
+    if d % num_splits != 0:
+        raise ValueError(f"d={d} not divisible by M={num_splits}")
+    e = d // num_splits
+    g = x.view(*prefix, num_splits, e)
     # Summed outer product: (..., E, E).
     summed = torch.einsum("...mi,...mj->...ij", g, g)
     if e == 1:
@@ -149,43 +149,43 @@ def spd_sum_packed(x: torch.Tensor, num_groups: int) -> torch.Tensor:
     return torch.cat([diag, off], dim=-1)
 
 
-def feature_map_out_dim(name: str, head_k_dim: int, num_groups: int = 1) -> int:
-    """Return q = output dim of psi given raw head_k_dim and (for spd) num_groups."""
+def feature_map_out_dim(name: str, head_k_dim: int, num_splits: int = 1) -> int:
+    """Return q = output dim of psi given raw head_k_dim and (for spd) num_splits."""
     if name in ("positive", "lorentz"):
         return head_k_dim
     if name == "spd_concat":
-        if head_k_dim % num_groups != 0:
+        if head_k_dim % num_splits != 0:
             raise ValueError(
-                f"head_k_dim {head_k_dim} not divisible by num_groups {num_groups}"
+                f"head_k_dim {head_k_dim} not divisible by num_splits {num_splits}"
             )
-        e = head_k_dim // num_groups
-        return num_groups * e * (e + 1) // 2
+        e = head_k_dim // num_splits
+        return num_splits * e * (e + 1) // 2
     if name == "spd_full":
-        if head_k_dim % num_groups != 0:
-            raise ValueError(f"d={head_k_dim} not divisible by M={num_groups}")
-        e = head_k_dim // num_groups
-        return num_groups * e * e
+        if head_k_dim % num_splits != 0:
+            raise ValueError(f"d={head_k_dim} not divisible by M={num_splits}")
+        e = head_k_dim // num_splits
+        return num_splits * e * e
     if name == "spd_sum":
-        if head_k_dim % num_groups != 0:
-            raise ValueError(f"d={head_k_dim} not divisible by M={num_groups}")
-        e = head_k_dim // num_groups
+        if head_k_dim % num_splits != 0:
+            raise ValueError(f"d={head_k_dim} not divisible by M={num_splits}")
+        e = head_k_dim // num_splits
         return e * e
     if name == "spd_sum_packed":
-        if head_k_dim % num_groups != 0:
-            raise ValueError(f"d={head_k_dim} not divisible by M={num_groups}")
-        e = head_k_dim // num_groups
+        if head_k_dim % num_splits != 0:
+            raise ValueError(f"d={head_k_dim} not divisible by M={num_splits}")
+        e = head_k_dim // num_splits
         return e * (e + 1) // 2
     if name == "kata_quadratic":
         # Implicit qd; never materialized. Bookkeeping: concat-SPD qd = M*E².
-        if head_k_dim % num_groups != 0:
-            raise ValueError(f"d={head_k_dim} not divisible by M={num_groups}")
-        e = head_k_dim // num_groups
-        return num_groups * e * e
+        if head_k_dim % num_splits != 0:
+            raise ValueError(f"d={head_k_dim} not divisible by M={num_splits}")
+        e = head_k_dim // num_splits
+        return num_splits * e * e
     if name == "kata_quadratic_sum":
         # Implicit qd; never materialized. Bookkeeping: sum-SPD qd = E².
-        if head_k_dim % num_groups != 0:
-            raise ValueError(f"d={head_k_dim} not divisible by M={num_groups}")
-        e = head_k_dim // num_groups
+        if head_k_dim % num_splits != 0:
+            raise ValueError(f"d={head_k_dim} not divisible by M={num_splits}")
+        e = head_k_dim // num_splits
         return e * e
     raise ValueError(f"unknown feature map {name!r}")
 
@@ -194,7 +194,7 @@ class FeatureMap(nn.Module):
     """Stateless wrapper. nn.Module so it lives inside attention layer."""
 
     def __init__(
-        self, name: str = "positive", num_groups: int = 1, eps: float = 1e-6
+        self, name: str = "positive", num_splits: int = 1, eps: float = 1e-6
     ):
         super().__init__()
         if name not in (
@@ -204,7 +204,7 @@ class FeatureMap(nn.Module):
         ):
             raise ValueError(f"unknown feature map {name!r}")
         self.name = name
-        self.num_groups = num_groups
+        self.num_splits = num_splits
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -213,14 +213,14 @@ class FeatureMap(nn.Module):
         if self.name == "lorentz":
             return lorentz(x)
         if self.name == "spd_concat":
-            return spd_concat(x, self.num_groups)
+            return spd_concat(x, self.num_splits)
         if self.name == "spd_full":
-            return spd_full(x, self.num_groups)
+            return spd_full(x, self.num_splits)
         if self.name == "spd_sum":
-            return spd_sum(x, self.num_groups)
-        return spd_sum_packed(x, self.num_groups)
+            return spd_sum(x, self.num_splits)
+        return spd_sum_packed(x, self.num_splits)
 
     def extra_repr(self) -> str:
         if self.name in ("spd_concat", "spd_full", "spd_sum", "spd_sum_packed"):
-            return f"name={self.name}, num_groups={self.num_groups}"
+            return f"name={self.name}, num_splits={self.num_splits}"
         return f"name={self.name}"
