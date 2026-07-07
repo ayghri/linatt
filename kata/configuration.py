@@ -32,6 +32,7 @@ class KataConfig(PretrainedConfig):
         spd_chunk_size: int = 32,
         use_delta: bool = False,
         delta_scale: float = 0.5,
+        delta_normalize: bool = False,
         use_offset_gate: bool = False,
         use_decay: bool = False,
         feature_map_eps: float = 1e-6,
@@ -78,6 +79,7 @@ class KataConfig(PretrainedConfig):
         self.spd_chunk_size = spd_chunk_size
         self.use_delta = use_delta
         self.delta_scale = delta_scale
+        self.delta_normalize = delta_normalize
         self.use_offset_gate = use_offset_gate
         self.use_decay = use_decay
         self.feature_map_eps = feature_map_eps

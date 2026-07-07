@@ -375,6 +375,7 @@ def _dq_kernel(
     k,
     U,
     do,
+    z,
     dq,
     s_scale,
     T,
@@ -386,7 +387,8 @@ def _dq_kernel(
     C: tl.constexpr,
     NC: tl.constexpr,
 ):
-    """dq_t from readout: dA_qk[t,s]=<do_t,U_s> (causal), then grad<q,k>^2. Program per (bh,query-block)."""
+    """dq_t from readout: dA_qk[t,s]=<do_t,U_s>-z_t (causal), then grad<q,k>^2. Program per (bh,query-block).
+    z_t=<do_t,o_t>/den_t centers for the normalized backward (z=0 -> raw un-normalized)."""
     i_bh = tl.program_id(0).to(tl.int64)
     i_ct = tl.program_id(1)
     bqk = i_bh * T * D
@@ -397,6 +399,10 @@ def _dq_kernel(
         tl.make_block_ptr(do + bv, (T, DV), (DV, 1), (ct0, 0), (C, DV), (1, 0)),
         boundary_check=(0, 1),
     ).to(tl.bfloat16)
+    b_z = tl.load(
+        tl.make_block_ptr(z + i_bh * T, (T,), (1,), (ct0,), (C,), (0,)),
+        boundary_check=(0,),
+    ).to(tl.float32)
     for g in range(M):
         b_qg = (
             tl.load(
@@ -414,7 +420,7 @@ def _dq_kernel(
                 tl.make_block_ptr(U + bv, (T, DV), (DV, 1), (cs0, 0), (C, DV), (1, 0)),
                 boundary_check=(0, 1),
             ).to(tl.bfloat16)
-            dAqk = tl.dot(b_do, tl.trans(b_U))  # (C,C) = <do_t, U_s>
+            dAqk = tl.dot(b_do, tl.trans(b_U)) - b_z[:, None]  # <do'_t,U_s> - z_t
             if i_cs == i_ct:
                 dAqk = tl.where(o_row[:, None] >= o_row[None, :], dAqk, 0.0)
             for hh in range(M):
@@ -437,7 +443,7 @@ def _dq_kernel(
         )
 
 
-def _dq(q, k, U, do, M, s, C):
+def _dq(q, k, U, do, z, M, s, C):
     B, H, T, D = q.shape
     DV = do.shape[-1]
     E = D // M
@@ -448,6 +454,7 @@ def _dq(q, k, U, do, M, s, C):
         k,
         U,
         do,
+        z,
         dq,
         s,
         T,
@@ -527,7 +534,7 @@ def _dvdb_kernel(
 
 @triton.autotune(configs=_AUTO_CFGS, key=['T', 'C', 'M', 'DV', 'BN'])
 @triton.jit
-def _dk_kernel(q, k, v, beta, U, dbV, do, dk, dv, dbeta, s_scale, T,
+def _dk_kernel(q, k, v, beta, U, dbV, do, z, dk, dv, dbeta, s_scale, T,
               H: tl.constexpr, D: tl.constexpr, E: tl.constexpr, M: tl.constexpr,
               DV: tl.constexpr, C: tl.constexpr, BN: tl.constexpr, FOLD: tl.constexpr):
     """dk over a BN-key tile (amortize the O(T^2) query reloads). Global-index causal masks.
@@ -547,7 +554,8 @@ def _dk_kernel(q, k, v, beta, U, dbV, do, dk, dv, dbeta, s_scale, T,
             do_t = tl.load(tl.make_block_ptr(do + bv, (T, DV), (DV, 1), (ct0, 0), (C, DV), (1, 0)), boundary_check=(0, 1)).to(tl.bfloat16)
             dbV_t = tl.load(tl.make_block_ptr(dbV + bv, (T, DV), (DV, 1), (ct0, 0), (C, DV), (1, 0)), boundary_check=(0, 1)).to(tl.bfloat16)
             beta_t = tl.load(tl.make_block_ptr(beta + i_bh * T, (T,), (1,), (ct0,), (C,), (0,)), boundary_check=(0,)).to(tl.float32)
-            dAqk = tl.dot(do_t, tl.trans(b_Uj))                           # (C, BN)
+            z_t = tl.load(tl.make_block_ptr(z + i_bh * T, (T,), (1,), (ct0,), (C,), (0,)), boundary_check=(0,)).to(tl.float32)
+            dAqk = tl.dot(do_t, tl.trans(b_Uj)) - z_t[:, None]            # <do'_t,U_s> - z_t  (C, BN)
             dAkk = -beta_t[:, None] * tl.dot(dbV_t, tl.trans(b_Uj))
             dAqk = tl.where(t_idx[:, None] >= k_idx[None, :], dAqk, 0.0)
             dAkk = tl.where(t_idx[:, None] > k_idx[None, :], dAkk, 0.0)
@@ -582,7 +590,7 @@ def _dk_kernel(q, k, v, beta, U, dbV, do, dk, dv, dbeta, s_scale, T,
                  dbeta_j.to(dbeta.dtype.element_ty), boundary_check=(0,))
 
 
-def flash_delta_bwd(q, k, v, beta, U, do, M, scale=None, C=64):
+def flash_delta_bwd(q, k, v, beta, U, do, M, scale=None, C=64, z=None):
     import math
 
     B, H, T, D = q.shape
@@ -591,9 +599,11 @@ def flash_delta_bwd(q, k, v, beta, U, do, M, scale=None, C=64):
     NC = T // C
     s = (1.0 / E if scale is None else scale) ** 0.5
     q, k, v, beta, U, do = (x.contiguous() for x in (q, k, v, beta, U, do))
+    # z_t = <do_t,o_t>/den_t centers dA_qk for the normalized backward; z=0 -> raw (do already scaled by 1/den)
+    z = torch.zeros(B, H, T, device=q.device, dtype=torch.float32) if z is None else z.contiguous().float()
     dU = _dU(q, k, do, U, M, s, C)
     dbV = _dbV_solve(k, beta, dU, M, s, C)
-    dq = _dq(q, k, U, do, M, s, C)
+    dq = _dq(q, k, U, do, z, M, s, C)
     dv = torch.empty(B, H, T, DV, device=q.device, dtype=torch.float32)
     dbeta = torch.empty(B, H, T, device=q.device, dtype=torch.float32)
     fold = M == 1                        # M=1: fold dv/dbeta into _dk (E_j is free there)
@@ -605,7 +615,7 @@ def flash_delta_bwd(q, k, v, beta, U, do, M, scale=None, C=64):
     dk = torch.zeros(B, H, T, D, device=q.device, dtype=torch.float32)
     BN = C          # key-tile == chunk for now (correctness focus)
     _dk_kernel[(B * H, triton.cdiv(T, BN))](
-        q, k, v, beta, U, dbV, do, dk, dv, dbeta, s, T,
+        q, k, v, beta, U, dbV, do, z, dk, dv, dbeta, s, T,
         H=H, D=D, E=E, M=M, DV=DV, C=C, BN=BN, FOLD=fold,
     )
     return dq, dk, dv, dbeta
@@ -685,22 +695,36 @@ def flash_delta_den(q, k, M, scale=None, C=64, BM=128):
 
 class _FlashDelta(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, beta, M, scale, C):
+    def forward(ctx, q, k, v, beta, M, scale, C, normalize, eps):
         U = flash_delta_U(q, k, v, beta, M, scale=scale, C=C)
-        o = flash_delta_readout(q, k, U, M, scale=scale, C=C)   # un-normalized numerator
-        ctx.save_for_backward(q, k, v, beta, U)
-        ctx.M, ctx.scale, ctx.C = M, scale, C
+        num = flash_delta_readout(q, k, U, M, scale=scale, C=C)   # numerator = tril(A_qk) U
+        if normalize:
+            den = flash_delta_den(q, k, M, scale=scale, C=C)
+            o = num / (den[..., None] + eps)
+            ctx.save_for_backward(q, k, v, beta, U, den, o)
+        else:
+            o = num
+            ctx.save_for_backward(q, k, v, beta, U)
+        ctx.M, ctx.scale, ctx.C, ctx.normalize, ctx.eps = M, scale, C, normalize, eps
         return o
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, beta, U = ctx.saved_tensors
-        dq, dk, dv, db = flash_delta_bwd(q, k, v, beta, U, do, ctx.M, ctx.scale, ctx.C)
-        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), db.to(beta.dtype), None, None, None
+        if ctx.normalize:
+            q, k, v, beta, U, den, o = ctx.saved_tensors
+            inv = 1.0 / (den[..., None] + ctx.eps)            # 1/den_t  (B,H,T,1)
+            dop = do * inv                                    # do'_t = do_t / den_t
+            z = (do * o).sum(-1) * inv[..., 0]                # z_t = <do_t,o_t>/den_t  (B,H,T)
+            dq, dk, dv, db = flash_delta_bwd(q, k, v, beta, U, dop, ctx.M, ctx.scale, ctx.C, z=z)
+        else:
+            q, k, v, beta, U = ctx.saved_tensors
+            dq, dk, dv, db = flash_delta_bwd(q, k, v, beta, U, do, ctx.M, ctx.scale, ctx.C)
+        return (dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), db.to(beta.dtype),
+                None, None, None, None, None)
 
 
-def flash_delta(q, k, v, beta, M, scale=None, C=64):
-    """Trainable full-SPD delta with KATA denominator normalization: o = num / (den+eps),
-    den_t = sum_{s<=t} A_qk[t,s]. den is detached (its gradient is a minor 2nd-order term);
-    normalization bounds o to a weighted average of U -> stable training. No psi / no E^2 state."""
-    return _FlashDelta.apply(q, k, v, beta, M, scale, C)
+def flash_delta(q, k, v, beta, M, scale=None, C=64, normalize=False, eps=1e-5):
+    """Trainable full-SPD delta. normalize=True -> o = num/(den+eps), den_t = sum_{s<=t} A_qk[t,s],
+    with a CONSISTENT backward: den propagates its gradient too (do' = do/den, dA_qk gets -z_t,
+    z_t = <do_t,o_t>/den_t). normalize=False -> raw numerator. No psi / no E^2 state."""
+    return _FlashDelta.apply(q, k, v, beta, M, scale, C, normalize, eps)
