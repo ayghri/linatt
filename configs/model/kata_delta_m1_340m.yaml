@@ -1,0 +1,40 @@
+name: kata_delta_m1_340m
+# M=1 full-SPD KATA with the content-based DELTA rule (flash kernel, no psi / no E^2 state).
+# Same backbone as kata_quadratic_m1_340m but the attention adds a delta erase (k_s.k_t)^2 with
+# a learned per-(token,head) write strength beta=sigmoid(b_proj) -> fixes overwrite/replacement
+# that plain KATA plateaus on. Routed to LinAtt/kata/spd/flash_delta.py flash_delta (scale=1.0,
+# C=64, fp32 Neumann). q,k use l2-norm so (q.k)^2 in [0,1] (well-conditioned erase).
+
+lr_mult:
+  attn: 1.0
+
+hf_kwargs:
+  model_type: kata
+  hidden_size: 1024
+  num_hidden_layers: 24
+  num_heads: 16
+  num_kv_heads: 16
+  expand_k: 1.0
+  expand_v: 1.0
+  feature_map: kata_quadratic     # concat-SPD score; delta branch computes (q.k)^2 inline
+  spd_num_groups: 1               # M=1 (single group = full-head SPD)
+  spd_use_kernel: false
+  use_delta: true                 # <-- flash SPD delta-rule (content erase + learned beta)
+  qk_norm: true
+  norm_q: l2                      # l2 -> (q.k)^2 in [0,1], well-conditioned erase inverse
+  norm_k: l2
+  use_short_conv: false
+  use_rope: true
+  rope_theta: 10000.0
+  rope_group: false
+  max_position_embeddings: 2048
+  hidden_ratio: 4
+  hidden_act: swish
+  norm_eps: 1.0e-6
+  tie_word_embeddings: true
+  fuse_norm: true
+  fuse_swiglu: true
+  fuse_cross_entropy: true
+  vocab_size: 32000
+  bos_token_id: 1
+  eos_token_id: 2

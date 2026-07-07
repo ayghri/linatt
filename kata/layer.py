@@ -33,6 +33,7 @@ from kata.parallel_kata_attn import (
     parallel_kata_attn_sum,
     parallel_kata_attn_sum_fwd_impl,
 )
+from kata.spd.flash_delta import flash_delta
 
 if TYPE_CHECKING:
     from fla.models.utils import Cache
@@ -52,6 +53,7 @@ class KataAttention(nn.Module):
         spd_num_groups: int = 1,
         spd_use_kernel: bool = False,
         spd_chunk_size: int = 32,
+        use_delta: bool = False,
         use_offset_gate: bool = False,
         use_decay: bool = False,
         feature_map_eps: float = 1e-6,
@@ -199,6 +201,10 @@ class KataAttention(nn.Module):
             raise ValueError(f"unsupported output_norm {output_norm!r}")
 
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+        # SPD delta-rule (content-based erase via the flash kernel); psi/state never formed.
+        self.use_delta = use_delta
+        if use_delta:
+            self.b_proj = nn.Linear(hidden_size, num_heads, bias=False)
 
         # Data-dependent affine offset for the SPD score: A=(a+<q,k>)^2 with
         # a_ts = sigmoid(a_proj(x_t)) * sigmoid(a_proj(x_s)) in [0,1]. Implemented
@@ -354,7 +360,23 @@ class KataAttention(nn.Module):
         recurrent_state = (
             last_state["recurrent_state"] if last_state is not None else None
         )
-        if self.feature_map_name in ("kata_quadratic", "kata_quadratic_sum"):
+        if self.use_delta:
+            # SPD delta-rule via the flash kernel: content erase (k_s.k_t)^2, no psi/state.
+            beta = torch.sigmoid(self.b_proj(hidden_states))              # (B,T,H)
+            M, C = self.spd_num_groups, 64
+            qh = q.transpose(1, 2).contiguous(); kh = k.transpose(1, 2).contiguous()
+            vh = v.transpose(1, 2).contiguous(); bh = beta.transpose(1, 2).contiguous()
+            Tl = qh.shape[2]
+            Tp = max(C, 1 << (Tl - 1).bit_length())                      # pow2 -> few autotune keys
+            if Tp != Tl:
+                p = Tp - Tl
+                qh = F.pad(qh, (0, 0, 0, p)); kh = F.pad(kh, (0, 0, 0, p))
+                vh = F.pad(vh, (0, 0, 0, p)); bh = F.pad(bh, (0, p))
+            o = flash_delta(qh.bfloat16(), kh.bfloat16(), vh.bfloat16(),
+                            bh.bfloat16(), M, scale=1.0, C=C)
+            o = o[:, :, :Tl].transpose(1, 2).to(v.dtype)                 # (B,T,H,Dv)
+            final_state = None
+        elif self.feature_map_name in ("kata_quadratic", "kata_quadratic_sum"):
             # FlashAttention-style quadratic kata; psi never materialized.
             # `kata_quadratic`     -> concat-SPD score Sum_i (q_i.k_i)^2
             # `kata_quadratic_sum` -> sum-SPD score   Sum_{i,j} (q_i.k_j)^2

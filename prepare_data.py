@@ -37,7 +37,7 @@ class ShardedDatasetStream:
             tokenizer_name,
             trust_remote_code=True,
             add_bos_token=True,
-            add_eos_token=True,
+            add_eos_token=False,
         )
         self.target_blocks = target_blocks
         self.seq_len = seq_len
