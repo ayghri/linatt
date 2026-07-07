@@ -152,9 +152,9 @@ def _flash_U_kernel(
         Pm = -(b_beta[:, None] * (Akk_cc * strict))
         Tm = eye + Pm
         for _i in tl.static_range(1, LOGC):
-            Pm = tl.dot(Pm, Pm, allow_tf32=False)
-            Tm = Tm + tl.dot(Tm, Pm, allow_tf32=False)
-        Uc = tl.dot(Tm, b_beta[:, None] * Vp, allow_tf32=True)
+            Pm = tl.dot(Pm.to(tl.bfloat16), Pm.to(tl.bfloat16))
+            Tm = Tm + tl.dot(Tm.to(tl.bfloat16), Pm.to(tl.bfloat16))
+        Uc = tl.dot(Tm.to(tl.bfloat16), (b_beta[:, None] * Vp).to(tl.bfloat16))
         tl.store(
             tl.make_block_ptr(U + bos_v, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)),
             Uc.to(U.dtype.element_ty),
@@ -407,9 +407,9 @@ def _dbV_kernel(
         Pm = -(b_beta_c[:, None] * (Akk_cc * strict))
         Tm = eye + Pm
         for _i in tl.static_range(1, LOGC):
-            Pm = tl.dot(Pm, Pm, allow_tf32=False)
-            Tm = Tm + tl.dot(Tm, Pm, allow_tf32=False)
-        dbV_c = tl.dot(tl.trans(Tm), rhs, allow_tf32=True)  # Tinv^T @ rhs
+            Pm = tl.dot(Pm.to(tl.bfloat16), Pm.to(tl.bfloat16))
+            Tm = Tm + tl.dot(Tm.to(tl.bfloat16), Pm.to(tl.bfloat16))
+        dbV_c = tl.dot(tl.trans(Tm).to(tl.bfloat16), rhs.to(tl.bfloat16))  # Tinv^T @ rhs
         tl.store(
             tl.make_block_ptr(dbV + bv, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)),
             dbV_c.to(dbV.dtype.element_ty),
