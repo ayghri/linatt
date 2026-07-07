@@ -20,6 +20,7 @@ hf_kwargs:
   spd_num_groups: 1               # M=1 (single group = full-head SPD)
   spd_use_kernel: false
   use_delta: true                 # <-- flash SPD delta-rule (content erase + learned beta)
+  delta_scale: 0.5                # A_kk_max=scale^2<1 -> bounded erase (1.0 NaN's at depth)
   qk_norm: true
   norm_q: l2                      # l2 -> (q.k)^2 in [0,1], well-conditioned erase inverse
   norm_k: l2
