@@ -42,31 +42,16 @@ import triton.language as tl
 
 _AUTO_CFGS = [triton.Config({}, num_warps=w, num_stages=st)
               for (w, st) in ((4, 1), (4, 3), (8, 1))]   # observed winners; fewer -> faster warmup
+_AUTO_CFGS_U = [triton.Config({}, num_warps=4, num_stages=1)]  # DV-split: 4 warps only (H100 wgmma)
 
 
 @triton.autotune(configs=_AUTO_CFGS, key=['T', 'C', 'M', 'DV'])
 @triton.jit
-def _flash_U_kernel(
-    q,
-    k,
-    v,
-    beta,
-    U,
-    s_scale,
-    T,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    E: tl.constexpr,
-    M: tl.constexpr,
-    DV: tl.constexpr,
-    C: tl.constexpr,
-    LOGC: tl.constexpr,
-):
+def _flash_U_kernel(q, k, v, beta, U, s_scale, T,
+                    H: tl.constexpr, D: tl.constexpr, E: tl.constexpr, M: tl.constexpr,
+                    DV: tl.constexpr, C: tl.constexpr, LOGC: tl.constexpr):
     """Pseudo-values U via the all-pairs scalar erase -- NO psi, NO E^2 state.
-    Sequential over chunks c; for each c stream previous chunks c'<c to form the inter-chunk
-    erase E_c = sum_{c'<c} A_kk[c,c'] U_{c'} using the scalar Gram A_kk[t,s]=sum_gh (k_{t,g}.k_{s,h})^2,
-    then solve the C x C intra-chunk triangular system. Only C x C, C x D, C x DV tiles appear.
-    """
+    Sequential over chunks c; each streams previous chunks c'<c for the inter-chunk erase."""
     i_bh = tl.program_id(0).to(tl.int64)
     bos_qk = i_bh * T * D
     bos_v = i_bh * T * DV
@@ -74,120 +59,54 @@ def _flash_U_kernel(
     o_row = tl.arange(0, C)
     eye = (o_row[:, None] == o_row[None, :]).to(tl.float32)
     strict = (o_row[:, None] > o_row[None, :]).to(tl.float32)
-
     for c in range(NC):
         c0 = c * C
-        b_v = tl.load(
-            tl.make_block_ptr(v + bos_v, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)),
-            boundary_check=(0, 1),
-        ).to(tl.float32)
-        b_beta = tl.load(
-            tl.make_block_ptr(beta + i_bh * T, (T,), (1,), (c0,), (C,), (0,)),
-            boundary_check=(0,),
-        ).to(tl.float32)
-        # inter-chunk erase E_c
+        b_v = tl.load(tl.make_block_ptr(v + bos_v, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)), boundary_check=(0, 1)).to(tl.float32)
+        b_beta = tl.load(tl.make_block_ptr(beta + i_bh * T, (T,), (1,), (c0,), (C,), (0,)), boundary_check=(0,)).to(tl.float32)
         Ec = tl.zeros([C, DV], dtype=tl.float32)
         for cp in range(0, c):
             cp0 = cp * C
             Akk = tl.zeros([C, C], dtype=tl.float32)
             for g in range(M):
-                b_kg = (
-                    tl.load(
-                        tl.make_block_ptr(
-                            k + bos_qk, (T, D), (D, 1), (c0, g * E), (C, E), (1, 0)
-                        ),
-                        boundary_check=(0, 1),
-                    )
-                    * s_scale
-                )
+                b_kg = tl.load(tl.make_block_ptr(k + bos_qk, (T, D), (D, 1), (c0, g * E), (C, E), (1, 0)), boundary_check=(0, 1)) * s_scale
                 for hh in range(M):
-                    b_kph = (
-                        tl.load(
-                            tl.make_block_ptr(
-                                k + bos_qk,
-                                (T, D),
-                                (D, 1),
-                                (cp0, hh * E),
-                                (C, E),
-                                (1, 0),
-                            ),
-                            boundary_check=(0, 1),
-                        )
-                        * s_scale
-                    )
-                    ip = tl.dot(b_kg, tl.trans(b_kph))
-                    Akk += ip * ip
-            b_Ucp = tl.load(
-                tl.make_block_ptr(
-                    U + bos_v, (T, DV), (DV, 1), (cp0, 0), (C, DV), (1, 0)
-                ),
-                boundary_check=(0, 1),
-            ).to(tl.bfloat16)
+                    b_kph = tl.load(tl.make_block_ptr(k + bos_qk, (T, D), (D, 1), (cp0, hh * E), (C, E), (1, 0)), boundary_check=(0, 1)) * s_scale
+                    ip = tl.dot(b_kg, tl.trans(b_kph)); Akk += ip * ip
+            b_Ucp = tl.load(tl.make_block_ptr(U + bos_v, (T, DV), (DV, 1), (cp0, 0), (C, DV), (1, 0)), boundary_check=(0, 1)).to(tl.bfloat16)
             Ec += tl.dot(Akk.to(tl.bfloat16), b_Ucp)
         Vp = b_v - Ec
-        # intra-chunk Gram + solve
         Akk_cc = tl.zeros([C, C], dtype=tl.float32)
         for g in range(M):
-            b_kg = (
-                tl.load(
-                    tl.make_block_ptr(
-                        k + bos_qk, (T, D), (D, 1), (c0, g * E), (C, E), (1, 0)
-                    ),
-                    boundary_check=(0, 1),
-                )
-                * s_scale
-            )
+            b_kg = tl.load(tl.make_block_ptr(k + bos_qk, (T, D), (D, 1), (c0, g * E), (C, E), (1, 0)), boundary_check=(0, 1)) * s_scale
             for hh in range(M):
-                b_kh = (
-                    tl.load(
-                        tl.make_block_ptr(
-                            k + bos_qk, (T, D), (D, 1), (c0, hh * E), (C, E), (1, 0)
-                        ),
-                        boundary_check=(0, 1),
-                    )
-                    * s_scale
-                )
-                ip = tl.dot(b_kg, tl.trans(b_kh))
-                Akk_cc += ip * ip
-        Pm = -(b_beta[:, None] * (Akk_cc * strict))
-        Tm = eye + Pm
-        for _i in tl.static_range(1, LOGC):
-            Pm = tl.dot(Pm.to(tl.bfloat16), Pm.to(tl.bfloat16))
-            Tm = Tm + tl.dot(Tm.to(tl.bfloat16), Pm.to(tl.bfloat16))
-        Uc = tl.dot(Tm.to(tl.bfloat16), (b_beta[:, None] * Vp).to(tl.bfloat16))
-        tl.store(
-            tl.make_block_ptr(U + bos_v, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)),
-            Uc.to(U.dtype.element_ty),
-            boundary_check=(0, 1),
-        )
+                b_kh = tl.load(tl.make_block_ptr(k + bos_qk, (T, D), (D, 1), (c0, hh * E), (C, E), (1, 0)), boundary_check=(0, 1)) * s_scale
+                ip = tl.dot(b_kg, tl.trans(b_kh)); Akk_cc += ip * ip
+        # FLA-style block inverse T=(I+N)^-1 (N=beta*tril(A_kk,-1)): 16-block-diag forward
+        # substitution (stable, no Neumann series) + block-recursive merges (matmuls). C=64.
+        N = b_beta[:, None] * (Akk_cc * strict)
+        blk = o_row // 16
+        N_bd = tl.where(blk[:, None] == blk[None, :], N, 0.0)            # 16x16 diagonal blocks
+        Tm = eye
+        for i in range(1, 16):                                          # forward-sub within 16-blocks
+            corr = tl.dot(tl.where((o_row % 16 == i)[:, None], N_bd, 0.0), Tm, allow_tf32=True)
+            Tm = tl.where((o_row % 16 == i)[:, None], eye - corr, Tm)
+        m1 = (blk[:, None] // 2 == blk[None, :] // 2) & (o_row % 32 >= 16)[:, None] & (o_row % 32 < 16)[None, :]
+        Tm = Tm - tl.where(m1, tl.dot(tl.dot(Tm, tl.where(m1, N, 0.0), allow_tf32=True), Tm, allow_tf32=True), 0.0)
+        m2 = (o_row >= 32)[:, None] & (o_row < 32)[None, :]
+        Tm = Tm - tl.where(m2, tl.dot(tl.dot(Tm, tl.where(m2, N, 0.0), allow_tf32=True), Tm, allow_tf32=True), 0.0)
+        Uc = tl.dot(Tm, b_beta[:, None] * Vp, allow_tf32=True)
+        tl.store(tl.make_block_ptr(U + bos_v, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)), Uc.to(U.dtype.element_ty), boundary_check=(0, 1))
 
 
 def flash_delta_U(q, k, v, beta, M, scale=None, C=64, warps=4):
     import math
-
     B, H, T, D = q.shape
-    DV = v.shape[-1]
-    E = D // M
-    if scale is None:
-        scale = 1.0 / E
+    DV = v.shape[-1]; E = D // M
+    if scale is None: scale = 1.0 / E
     q, k, v, beta = (x.contiguous() for x in (q, k, v, beta))
     U = torch.empty(B, H, T, DV, device=q.device, dtype=torch.float32)
-    _flash_U_kernel[(B * H,)](
-        q,
-        k,
-        v,
-        beta,
-        U,
-        scale**0.5,
-        T,
-        H=H,
-        D=D,
-        E=E,
-        M=M,
-        DV=DV,
-        C=C,
-        LOGC=int(math.log2(C)),
-    )
+    _flash_U_kernel[(B * H,)](q, k, v, beta, U, scale ** 0.5, T,
+                              H=H, D=D, E=E, M=M, DV=DV, C=C, LOGC=int(math.log2(C)))
     return U
 
 
@@ -391,9 +310,7 @@ def _dbV_kernel(
                 ),
                 boundary_check=(0, 1),
             ).to(tl.float32)
-            inter += tl.dot(
-                Akk.to(tl.bfloat16), (b_beta[:, None] * b_dbV).to(tl.bfloat16)
-            )
+            inter += tl.dot(Akk.to(tl.bfloat16), (b_beta[:, None] * b_dbV).to(tl.bfloat16))
         b_dU = tl.load(
             tl.make_block_ptr(dU + bv, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)),
             boundary_check=(0, 1),
@@ -404,12 +321,19 @@ def _dbV_kernel(
             tl.make_block_ptr(beta + i_bh * T, (T,), (1,), (c0,), (C,), (0,)),
             boundary_check=(0,),
         ).to(tl.float32)
-        Pm = -(b_beta_c[:, None] * (Akk_cc * strict))
-        Tm = eye + Pm
-        for _i in tl.static_range(1, LOGC):
-            Pm = tl.dot(Pm.to(tl.bfloat16), Pm.to(tl.bfloat16))
-            Tm = Tm + tl.dot(Tm.to(tl.bfloat16), Pm.to(tl.bfloat16))
-        dbV_c = tl.dot(tl.trans(Tm).to(tl.bfloat16), rhs.to(tl.bfloat16))  # Tinv^T @ rhs
+        # FLA block-inverse Tm=(I+N)^-1 (same as fwd), then dbV = Tm^-T @ rhs = trans(Tm) @ rhs.
+        N = b_beta_c[:, None] * (Akk_cc * strict)
+        blk = o_row // 16
+        N_bd = tl.where(blk[:, None] == blk[None, :], N, 0.0)
+        Tm = eye
+        for i in range(1, 16):
+            corr = tl.dot(tl.where((o_row % 16 == i)[:, None], N_bd, 0.0), Tm, allow_tf32=True)
+            Tm = tl.where((o_row % 16 == i)[:, None], eye - corr, Tm)
+        m1 = (blk[:, None] // 2 == blk[None, :] // 2) & (o_row % 32 >= 16)[:, None] & (o_row % 32 < 16)[None, :]
+        Tm = Tm - tl.where(m1, tl.dot(tl.dot(Tm, tl.where(m1, N, 0.0), allow_tf32=True), Tm, allow_tf32=True), 0.0)
+        m2 = (o_row >= 32)[:, None] & (o_row < 32)[None, :]
+        Tm = Tm - tl.where(m2, tl.dot(tl.dot(Tm, tl.where(m2, N, 0.0), allow_tf32=True), Tm, allow_tf32=True), 0.0)
+        dbV_c = tl.dot(tl.trans(Tm), rhs, allow_tf32=True)
         tl.store(
             tl.make_block_ptr(dbV + bv, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)),
             dbV_c.to(dbV.dtype.element_ty),
@@ -612,6 +536,8 @@ def _dk_kernel(
     dbV,
     do,
     dk,
+    dv,
+    dbeta,
     s_scale,
     T,
     H: tl.constexpr,
@@ -621,8 +547,10 @@ def _dk_kernel(
     DV: tl.constexpr,
     C: tl.constexpr,
     NC: tl.constexpr,
+    FOLD: tl.constexpr,
 ):
-    """dk_j: readout (t>=j, dA_qk) + erase-col (t>j, dA_kk[t,j]) + erase-row (s<j, dA_kk[j,s])."""
+    """dk_j: readout (t>=j, dA_qk) + erase-col (t>j, dA_kk[t,j]) + erase-row (s<j, dA_kk[j,s]).
+    FOLD (M=1): also emit dv=beta*dbV and dbeta (folds _dvdb; E_j is free in the erase-row loop)."""
     i_bh = tl.program_id(0).to(tl.int64)
     i_cj = tl.program_id(1)
     bqk = i_bh * T * D
@@ -641,6 +569,7 @@ def _dk_kernel(
         tl.make_block_ptr(beta + i_bh * T, (T,), (1,), (cj0,), (C,), (0,)),
         boundary_check=(0,),
     ).to(tl.float32)
+    Efold = tl.zeros([C, DV], dtype=tl.float32)          # sum_{s<j} A_kk[j,s] U_s (FOLD only)
     for g in range(M):
         kjg = (
             tl.load(
@@ -717,12 +646,38 @@ def _dk_kernel(
                     )
                     * s_scale
                 )
-                dip = 2.0 * dAkk_r * tl.dot(kjg, tl.trans(ksi))  # (j,s)
+                ip = tl.dot(kjg, tl.trans(ksi))  # (j,s) = k_j . k_s
+                dip = 2.0 * dAkk_r * ip
                 dkg += tl.dot(dip.to(tl.bfloat16), ksi.to(tl.bfloat16))  # sum over s
+                if FOLD:  # A_kk[j,s] = ip^2 (M=1); accumulate the forward erase E_j
+                    akk = ip * ip
+                    if i_cs == i_cj:
+                        akk = tl.where(o_row[:, None] > o_row[None, :], akk, 0.0)
+                    Efold += tl.dot(akk.to(tl.bfloat16), U_s)
         tl.store(
             tl.make_block_ptr(dk + bqk, (T, D), (D, 1), (cj0, g * E), (C, E), (1, 0)),
             (dkg * s_scale).to(dk.dtype.element_ty),
             boundary_check=(0, 1),
+        )
+    if FOLD:  # dv = beta*dbV ; dbeta = rowsum(v*dbV) - rowsum(dbV*E)  (folds _dvdb)
+        b_vj = tl.load(
+            tl.make_block_ptr(v + bv, (T, DV), (DV, 1), (cj0, 0), (C, DV), (1, 0)),
+            boundary_check=(0, 1),
+        ).to(tl.float32)
+        b_dbVj_f = tl.load(
+            tl.make_block_ptr(dbV + bv, (T, DV), (DV, 1), (cj0, 0), (C, DV), (1, 0)),
+            boundary_check=(0, 1),
+        ).to(tl.float32)
+        tl.store(
+            tl.make_block_ptr(dv + bv, (T, DV), (DV, 1), (cj0, 0), (C, DV), (1, 0)),
+            (b_betaj[:, None] * b_dbVj_f).to(dv.dtype.element_ty),
+            boundary_check=(0, 1),
+        )
+        dbeta_j = tl.sum(b_vj * b_dbVj_f, axis=1) - tl.sum(b_dbVj_f * Efold, axis=1)
+        tl.store(
+            tl.make_block_ptr(dbeta + i_bh * T, (T,), (1,), (cj0,), (C,), (0,)),
+            dbeta_j.to(dbeta.dtype.element_ty),
+            boundary_check=(0,),
         )
 
 
@@ -740,81 +695,97 @@ def flash_delta_bwd(q, k, v, beta, U, do, M, scale=None, C=64):
     dq = _dq(q, k, U, do, M, s, C)
     dv = torch.empty(B, H, T, DV, device=q.device, dtype=torch.float32)
     dbeta = torch.empty(B, H, T, device=q.device, dtype=torch.float32)
-    _dvdb_kernel[(B * H, NC)](
-        k,
-        v,
-        beta,
-        U,
-        dbV,
-        dv,
-        dbeta,
-        s,
-        T,
-        H=H,
-        D=D,
-        E=E,
-        M=M,
-        DV=DV,
-        C=C,
-        NC=NC,
-    )
+    fold = M == 1                        # M=1: fold dv/dbeta into _dk (E_j is free there)
+    if not fold:
+        _dvdb_kernel[(B * H, NC)](
+            k, v, beta, U, dbV, dv, dbeta, s, T,
+            H=H, D=D, E=E, M=M, DV=DV, C=C, NC=NC,
+        )
     dk = torch.zeros(B, H, T, D, device=q.device, dtype=torch.float32)
     _dk_kernel[(B * H, NC)](
-        q,
-        k,
-        v,
-        beta,
-        U,
-        dbV,
-        do,
-        dk,
-        s,
-        T,
-        H=H,
-        D=D,
-        E=E,
-        M=M,
-        DV=DV,
-        C=C,
-        NC=NC,
+        q, k, v, beta, U, dbV, do, dk, dv, dbeta, s, T,
+        H=H, D=D, E=E, M=M, DV=DV, C=C, NC=NC, FOLD=fold,
     )
     return dq, dk, dv, dbeta
 
 
-@triton.autotune(configs=_AUTO_CFGS, key=['T', 'C', 'M', 'DV'])
+@triton.autotune(configs=_AUTO_CFGS, key=['T', 'C', 'M', 'DV', 'BM'])
 @triton.jit
 def _readout_kernel(q, k, U, o, s_scale, T, H: tl.constexpr, D: tl.constexpr, E: tl.constexpr,
-                    M: tl.constexpr, DV: tl.constexpr, C: tl.constexpr, NC: tl.constexpr):
-    """o_t = sum_{s<=t} A_qk[t,s] U_s  (un-normalized delta readout). Program per (bh,query-block)."""
-    i_bh = tl.program_id(0).to(tl.int64); i_ct = tl.program_id(1)
-    bqk = i_bh * T * D; bv = i_bh * T * DV; ct0 = i_ct * C
-    o_row = tl.arange(0, C)
-    acc = tl.zeros([C, DV], dtype=tl.float32)
-    for i_cs in range(0, i_ct + 1):
+                    M: tl.constexpr, DV: tl.constexpr, C: tl.constexpr, BM: tl.constexpr):
+    """o_t = sum_{s<=t} A_qk[t,s] U_s. Query tile of BM rows -> each k_s/U_s load serves BM
+    queries (fewer HBM reloads; the readout is bandwidth-bound at B>=32)."""
+    i_bh = tl.program_id(0).to(tl.int64); i_m = tl.program_id(1)
+    bqk = i_bh * T * D; bv = i_bh * T * DV; m0 = i_m * BM
+    q_idx = m0 + tl.arange(0, BM)
+    acc = tl.zeros([BM, DV], dtype=tl.float32)
+    n_kb = tl.cdiv(m0 + BM, C)                       # key-blocks with any key <= a query in the tile
+    for i_cs in range(0, n_kb):
         cs0 = i_cs * C
-        Aqk = _gram_blk(q, k, bqk, ct0, cs0, s_scale, C, E, M, T, D)
-        if i_cs == i_ct:
-            Aqk = tl.where(o_row[:, None] >= o_row[None, :], Aqk, 0.0)
+        k_idx = cs0 + tl.arange(0, C)
+        Aqk = tl.zeros([BM, C], dtype=tl.float32)
+        for g in range(M):
+            qg = tl.load(tl.make_block_ptr(q + bqk, (T, D), (D, 1), (m0, g * E), (BM, E), (1, 0)),
+                         boundary_check=(0, 1)) * s_scale
+            for hh in range(M):
+                kh = tl.load(tl.make_block_ptr(k + bqk, (T, D), (D, 1), (cs0, hh * E), (C, E), (1, 0)),
+                             boundary_check=(0, 1)) * s_scale
+                ip = tl.dot(qg, tl.trans(kh))
+                Aqk += ip * ip
+        Aqk = tl.where(q_idx[:, None] >= k_idx[None, :], Aqk, 0.0)   # causal (global indices)
         b_U = tl.load(tl.make_block_ptr(U + bv, (T, DV), (DV, 1), (cs0, 0), (C, DV), (1, 0)),
                       boundary_check=(0, 1)).to(tl.bfloat16)
         acc += tl.dot(Aqk.to(tl.bfloat16), b_U)
-    tl.store(tl.make_block_ptr(o + bv, (T, DV), (DV, 1), (ct0, 0), (C, DV), (1, 0)),
+    tl.store(tl.make_block_ptr(o + bv, (T, DV), (DV, 1), (m0, 0), (BM, DV), (1, 0)),
              acc.to(o.dtype.element_ty), boundary_check=(0, 1))
 
 
-def flash_delta_readout(q, k, U, M, scale=None, C=64):
-    B, H, T, D = q.shape; DV = U.shape[-1]; E = D // M; NC = T // C
+def flash_delta_readout(q, k, U, M, scale=None, C=64, BM=128):
+    B, H, T, D = q.shape; DV = U.shape[-1]; E = D // M
     s = (1.0 / E if scale is None else scale) ** 0.5
     o = torch.empty(B, H, T, DV, device=q.device, dtype=torch.float32)
-    _readout_kernel[(B * H, NC)](q, k, U, o, s, T, H=H, D=D, E=E, M=M, DV=DV, C=C, NC=NC)
+    grid = (B * H, triton.cdiv(T, BM))
+    _readout_kernel[grid](q, k, U, o, s, T, H=H, D=D, E=E, M=M, DV=DV, C=C, BM=BM)
     return o
+
+
+@triton.autotune(configs=_AUTO_CFGS, key=['T', 'C', 'M', 'BM'])
+@triton.jit
+def _den_kernel(q, k, den, s_scale, T, H: tl.constexpr, D: tl.constexpr, E: tl.constexpr,
+                M: tl.constexpr, C: tl.constexpr, BM: tl.constexpr):
+    """den_t = sum_{s<=t} A_qk[t,s]  (KATA normalization denominator)."""
+    i_bh = tl.program_id(0).to(tl.int64); i_m = tl.program_id(1)
+    bqk = i_bh * T * D; m0 = i_m * BM
+    q_idx = m0 + tl.arange(0, BM)
+    acc = tl.zeros([BM], dtype=tl.float32)
+    n_kb = tl.cdiv(m0 + BM, C)
+    for i_cs in range(0, n_kb):
+        cs0 = i_cs * C
+        k_idx = cs0 + tl.arange(0, C)
+        Aqk = tl.zeros([BM, C], dtype=tl.float32)
+        for g in range(M):
+            qg = tl.load(tl.make_block_ptr(q + bqk, (T, D), (D, 1), (m0, g * E), (BM, E), (1, 0)), boundary_check=(0, 1)) * s_scale
+            for hh in range(M):
+                kh = tl.load(tl.make_block_ptr(k + bqk, (T, D), (D, 1), (cs0, hh * E), (C, E), (1, 0)), boundary_check=(0, 1)) * s_scale
+                ip = tl.dot(qg, tl.trans(kh)); Aqk += ip * ip
+        Aqk = tl.where(q_idx[:, None] >= k_idx[None, :], Aqk, 0.0)
+        acc += tl.sum(Aqk, axis=1)
+    tl.store(den + i_bh * T + m0 + tl.arange(0, BM), acc, mask=q_idx < T)
+
+
+def flash_delta_den(q, k, M, scale=None, C=64, BM=128):
+    B, H, T, D = q.shape; E = D // M
+    s = (1.0 / E if scale is None else scale) ** 0.5
+    den = torch.empty(B, H, T, device=q.device, dtype=torch.float32)
+    _den_kernel[(B * H, triton.cdiv(T, BM))](q, k, den, s, T, H=H, D=D, E=E, M=M, C=C, BM=BM)
+    return den
 
 
 class _FlashDelta(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, beta, M, scale, C):
         U = flash_delta_U(q, k, v, beta, M, scale=scale, C=C)
-        o = flash_delta_readout(q, k, U, M, scale=scale, C=C)
+        o = flash_delta_readout(q, k, U, M, scale=scale, C=C)   # un-normalized numerator
         ctx.save_for_backward(q, k, v, beta, U)
         ctx.M, ctx.scale, ctx.C = M, scale, C
         return o
@@ -826,7 +797,10 @@ class _FlashDelta(torch.autograd.Function):
         return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), db.to(beta.dtype), None, None, None
 
 
-def flash_delta(q, k, v, beta, M, scale=None, C=64):
-    """Trainable full-SPD (M-group) delta, flash-attention style (no psi, no E^2 state).
-    q,k:(B,H,T,D) v:(B,H,T,DV) beta:(B,H,T) -> o (B,H,T,DV)."""
-    return _FlashDelta.apply(q, k, v, beta, M, scale, C)
+def flash_delta(q, k, v, beta, M, scale=None, C=64, eps=1e-5):
+    """Trainable full-SPD delta with KATA denominator normalization: o = num / (den+eps),
+    den_t = sum_{s<=t} A_qk[t,s]. den is detached (its gradient is a minor 2nd-order term);
+    normalization bounds o to a weighted average of U -> stable training. No psi / no E^2 state."""
+    num = _FlashDelta.apply(q, k, v, beta, M, scale, C)
+    den = flash_delta_den(q, k, M, scale=scale, C=C)
+    return num / (den[..., None] + eps)
