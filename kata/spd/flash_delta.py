@@ -41,7 +41,7 @@ import triton
 import triton.language as tl
 
 _AUTO_CFGS = [triton.Config({}, num_warps=w, num_stages=st)
-              for (w, st) in ((4, 1), (4, 3), (8, 1))]   # observed winners; fewer -> faster warmup
+              for w in (2, 4, 8) for st in (1, 2, 3)]   # full sweep for the matmul-heavy block-inverse
 _AUTO_CFGS_U = [triton.Config({}, num_warps=4, num_stages=1)]  # DV-split: 4 warps only (H100 wgmma)
 
 
@@ -525,160 +525,61 @@ def _dvdb_kernel(
     )
 
 
-@triton.autotune(configs=_AUTO_CFGS, key=['T', 'C', 'M', 'DV'])
+@triton.autotune(configs=_AUTO_CFGS, key=['T', 'C', 'M', 'DV', 'BN'])
 @triton.jit
-def _dk_kernel(
-    q,
-    k,
-    v,
-    beta,
-    U,
-    dbV,
-    do,
-    dk,
-    dv,
-    dbeta,
-    s_scale,
-    T,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    E: tl.constexpr,
-    M: tl.constexpr,
-    DV: tl.constexpr,
-    C: tl.constexpr,
-    NC: tl.constexpr,
-    FOLD: tl.constexpr,
-):
-    """dk_j: readout (t>=j, dA_qk) + erase-col (t>j, dA_kk[t,j]) + erase-row (s<j, dA_kk[j,s]).
-    FOLD (M=1): also emit dv=beta*dbV and dbeta (folds _dvdb; E_j is free in the erase-row loop)."""
-    i_bh = tl.program_id(0).to(tl.int64)
-    i_cj = tl.program_id(1)
-    bqk = i_bh * T * D
-    bv = i_bh * T * DV
-    cj0 = i_cj * C
-    o_row = tl.arange(0, C)
-    b_Uj = tl.load(
-        tl.make_block_ptr(U + bv, (T, DV), (DV, 1), (cj0, 0), (C, DV), (1, 0)),
-        boundary_check=(0, 1),
-    ).to(tl.bfloat16)
-    b_dbVj = tl.load(
-        tl.make_block_ptr(dbV + bv, (T, DV), (DV, 1), (cj0, 0), (C, DV), (1, 0)),
-        boundary_check=(0, 1),
-    ).to(tl.bfloat16)
-    b_betaj = tl.load(
-        tl.make_block_ptr(beta + i_bh * T, (T,), (1,), (cj0,), (C,), (0,)),
-        boundary_check=(0,),
-    ).to(tl.float32)
-    Efold = tl.zeros([C, DV], dtype=tl.float32)          # sum_{s<j} A_kk[j,s] U_s (FOLD only)
+def _dk_kernel(q, k, v, beta, U, dbV, do, dk, dv, dbeta, s_scale, T,
+              H: tl.constexpr, D: tl.constexpr, E: tl.constexpr, M: tl.constexpr,
+              DV: tl.constexpr, C: tl.constexpr, BN: tl.constexpr, FOLD: tl.constexpr):
+    """dk over a BN-key tile (amortize the O(T^2) query reloads). Global-index causal masks.
+    readout (t>=j, dA_qk) + erase-col (t>j, dA_kk[t,j]) + erase-row (s<j, dA_kk[j,s]); FOLD -> dv,dbeta."""
+    i_bh = tl.program_id(0).to(tl.int64); i_n = tl.program_id(1)
+    bqk = i_bh * T * D; bv = i_bh * T * DV; n0 = i_n * BN
+    k_idx = n0 + tl.arange(0, BN)
+    b_Uj = tl.load(tl.make_block_ptr(U + bv, (T, DV), (DV, 1), (n0, 0), (BN, DV), (1, 0)), boundary_check=(0, 1)).to(tl.bfloat16)
+    b_dbVj = tl.load(tl.make_block_ptr(dbV + bv, (T, DV), (DV, 1), (n0, 0), (BN, DV), (1, 0)), boundary_check=(0, 1)).to(tl.bfloat16)
+    b_betaj = tl.load(tl.make_block_ptr(beta + i_bh * T, (T,), (1,), (n0,), (BN,), (0,)), boundary_check=(0,)).to(tl.float32)
+    Efold = tl.zeros([BN, DV], dtype=tl.float32)
     for g in range(M):
-        kjg = (
-            tl.load(
-                tl.make_block_ptr(
-                    k + bqk, (T, D), (D, 1), (cj0, g * E), (C, E), (1, 0)
-                ),
-                boundary_check=(0, 1),
-            )
-            * s_scale
-        )
-        dkg = tl.zeros([C, E], dtype=tl.float32)
-        # rows t >= j : readout dA_qk[t,j] and erase-col dA_kk[t,j]
-        for i_ct in range(i_cj, NC):
-            ct0 = i_ct * C
-            do_t = tl.load(
-                tl.make_block_ptr(do + bv, (T, DV), (DV, 1), (ct0, 0), (C, DV), (1, 0)),
-                boundary_check=(0, 1),
-            ).to(tl.bfloat16)
-            dbV_t = tl.load(
-                tl.make_block_ptr(
-                    dbV + bv, (T, DV), (DV, 1), (ct0, 0), (C, DV), (1, 0)
-                ),
-                boundary_check=(0, 1),
-            ).to(tl.bfloat16)
-            beta_t = tl.load(
-                tl.make_block_ptr(beta + i_bh * T, (T,), (1,), (ct0,), (C,), (0,)),
-                boundary_check=(0,),
-            ).to(tl.float32)
-            dAqk = tl.dot(do_t, tl.trans(b_Uj))  # (t,j)
-            dAkk = -beta_t[:, None] * tl.dot(dbV_t, tl.trans(b_Uj))  # (t,j)
-            if i_ct == i_cj:
-                dAqk = tl.where(o_row[:, None] >= o_row[None, :], dAqk, 0.0)
-                dAkk = tl.where(o_row[:, None] > o_row[None, :], dAkk, 0.0)
+        kjg = tl.load(tl.make_block_ptr(k + bqk, (T, D), (D, 1), (n0, g * E), (BN, E), (1, 0)), boundary_check=(0, 1)) * s_scale
+        dkg = tl.zeros([BN, E], dtype=tl.float32)
+        for ct0 in range(n0, T, C):                                       # queries t >= tile keys
+            t_idx = ct0 + tl.arange(0, C)
+            do_t = tl.load(tl.make_block_ptr(do + bv, (T, DV), (DV, 1), (ct0, 0), (C, DV), (1, 0)), boundary_check=(0, 1)).to(tl.bfloat16)
+            dbV_t = tl.load(tl.make_block_ptr(dbV + bv, (T, DV), (DV, 1), (ct0, 0), (C, DV), (1, 0)), boundary_check=(0, 1)).to(tl.bfloat16)
+            beta_t = tl.load(tl.make_block_ptr(beta + i_bh * T, (T,), (1,), (ct0,), (C,), (0,)), boundary_check=(0,)).to(tl.float32)
+            dAqk = tl.dot(do_t, tl.trans(b_Uj))                           # (C, BN)
+            dAkk = -beta_t[:, None] * tl.dot(dbV_t, tl.trans(b_Uj))
+            dAqk = tl.where(t_idx[:, None] >= k_idx[None, :], dAqk, 0.0)
+            dAkk = tl.where(t_idx[:, None] > k_idx[None, :], dAkk, 0.0)
             for i in range(M):
-                qti = (
-                    tl.load(
-                        tl.make_block_ptr(
-                            q + bqk, (T, D), (D, 1), (ct0, i * E), (C, E), (1, 0)
-                        ),
-                        boundary_check=(0, 1),
-                    )
-                    * s_scale
-                )
-                kti = (
-                    tl.load(
-                        tl.make_block_ptr(
-                            k + bqk, (T, D), (D, 1), (ct0, i * E), (C, E), (1, 0)
-                        ),
-                        boundary_check=(0, 1),
-                    )
-                    * s_scale
-                )
-                dip_ro = 2.0 * dAqk * tl.dot(qti, tl.trans(kjg))  # (t,j)
+                qti = tl.load(tl.make_block_ptr(q + bqk, (T, D), (D, 1), (ct0, i * E), (C, E), (1, 0)), boundary_check=(0, 1)) * s_scale
+                kti = tl.load(tl.make_block_ptr(k + bqk, (T, D), (D, 1), (ct0, i * E), (C, E), (1, 0)), boundary_check=(0, 1)) * s_scale
+                dip_ro = 2.0 * dAqk * tl.dot(qti, tl.trans(kjg))          # (C, BN)
                 dip_er = 2.0 * dAkk * tl.dot(kti, tl.trans(kjg))
-                dkg += tl.dot(tl.trans(dip_ro).to(tl.bfloat16), qti.to(tl.bfloat16))
+                dkg += tl.dot(tl.trans(dip_ro).to(tl.bfloat16), qti.to(tl.bfloat16))   # (BN, E)
                 dkg += tl.dot(tl.trans(dip_er).to(tl.bfloat16), kti.to(tl.bfloat16))
-        # cols s < j : erase-row dA_kk[j,s] = beta_j (-dbV_j . U_s)
-        for i_cs in range(0, i_cj + 1):
-            cs0 = i_cs * C
-            U_s = tl.load(
-                tl.make_block_ptr(U + bv, (T, DV), (DV, 1), (cs0, 0), (C, DV), (1, 0)),
-                boundary_check=(0, 1),
-            ).to(tl.bfloat16)
-            dAkk_r = -b_betaj[:, None] * tl.dot(b_dbVj, tl.trans(U_s))  # (j,s)
-            if i_cs == i_cj:
-                dAkk_r = tl.where(o_row[:, None] > o_row[None, :], dAkk_r, 0.0)
+        for cs0 in range(0, n0 + BN, C):                                  # keys s < tile keys
+            s_idx = cs0 + tl.arange(0, C)
+            U_s = tl.load(tl.make_block_ptr(U + bv, (T, DV), (DV, 1), (cs0, 0), (C, DV), (1, 0)), boundary_check=(0, 1)).to(tl.bfloat16)
+            dAkk_r = -b_betaj[:, None] * tl.dot(b_dbVj, tl.trans(U_s))     # (BN, C)
+            dAkk_r = tl.where(k_idx[:, None] > s_idx[None, :], dAkk_r, 0.0)
             for i in range(M):
-                ksi = (
-                    tl.load(
-                        tl.make_block_ptr(
-                            k + bqk, (T, D), (D, 1), (cs0, i * E), (C, E), (1, 0)
-                        ),
-                        boundary_check=(0, 1),
-                    )
-                    * s_scale
-                )
-                ip = tl.dot(kjg, tl.trans(ksi))  # (j,s) = k_j . k_s
-                dip = 2.0 * dAkk_r * ip
-                dkg += tl.dot(dip.to(tl.bfloat16), ksi.to(tl.bfloat16))  # sum over s
-                if FOLD:  # A_kk[j,s] = ip^2 (M=1); accumulate the forward erase E_j
-                    akk = ip * ip
-                    if i_cs == i_cj:
-                        akk = tl.where(o_row[:, None] > o_row[None, :], akk, 0.0)
-                    Efold += tl.dot(akk.to(tl.bfloat16), U_s)
-        tl.store(
-            tl.make_block_ptr(dk + bqk, (T, D), (D, 1), (cj0, g * E), (C, E), (1, 0)),
-            (dkg * s_scale).to(dk.dtype.element_ty),
-            boundary_check=(0, 1),
-        )
-    if FOLD:  # dv = beta*dbV ; dbeta = rowsum(v*dbV) - rowsum(dbV*E)  (folds _dvdb)
-        b_vj = tl.load(
-            tl.make_block_ptr(v + bv, (T, DV), (DV, 1), (cj0, 0), (C, DV), (1, 0)),
-            boundary_check=(0, 1),
-        ).to(tl.float32)
-        b_dbVj_f = tl.load(
-            tl.make_block_ptr(dbV + bv, (T, DV), (DV, 1), (cj0, 0), (C, DV), (1, 0)),
-            boundary_check=(0, 1),
-        ).to(tl.float32)
-        tl.store(
-            tl.make_block_ptr(dv + bv, (T, DV), (DV, 1), (cj0, 0), (C, DV), (1, 0)),
-            (b_betaj[:, None] * b_dbVj_f).to(dv.dtype.element_ty),
-            boundary_check=(0, 1),
-        )
+                ksi = tl.load(tl.make_block_ptr(k + bqk, (T, D), (D, 1), (cs0, i * E), (C, E), (1, 0)), boundary_check=(0, 1)) * s_scale
+                ip = tl.dot(kjg, tl.trans(ksi))                           # (BN, C)
+                dkg += tl.dot((2.0 * dAkk_r * ip).to(tl.bfloat16), ksi.to(tl.bfloat16))
+                if FOLD:
+                    akk = tl.where(k_idx[:, None] > s_idx[None, :], ip * ip, 0.0)
+                    Efold += tl.dot(akk.to(tl.bfloat16), U_s)             # (BN, DV)
+        tl.store(tl.make_block_ptr(dk + bqk, (T, D), (D, 1), (n0, g * E), (BN, E), (1, 0)),
+                 (dkg * s_scale).to(dk.dtype.element_ty), boundary_check=(0, 1))
+    if FOLD:
+        b_vj = tl.load(tl.make_block_ptr(v + bv, (T, DV), (DV, 1), (n0, 0), (BN, DV), (1, 0)), boundary_check=(0, 1)).to(tl.float32)
+        b_dbVj_f = tl.load(tl.make_block_ptr(dbV + bv, (T, DV), (DV, 1), (n0, 0), (BN, DV), (1, 0)), boundary_check=(0, 1)).to(tl.float32)
+        tl.store(tl.make_block_ptr(dv + bv, (T, DV), (DV, 1), (n0, 0), (BN, DV), (1, 0)),
+                 (b_betaj[:, None] * b_dbVj_f).to(dv.dtype.element_ty), boundary_check=(0, 1))
         dbeta_j = tl.sum(b_vj * b_dbVj_f, axis=1) - tl.sum(b_dbVj_f * Efold, axis=1)
-        tl.store(
-            tl.make_block_ptr(dbeta + i_bh * T, (T,), (1,), (cj0,), (C,), (0,)),
-            dbeta_j.to(dbeta.dtype.element_ty),
-            boundary_check=(0,),
-        )
+        tl.store(tl.make_block_ptr(dbeta + i_bh * T, (T,), (1,), (n0,), (BN,), (0,)),
+                 dbeta_j.to(dbeta.dtype.element_ty), boundary_check=(0,))
 
 
 def flash_delta_bwd(q, k, v, beta, U, do, M, scale=None, C=64):
@@ -702,9 +603,10 @@ def flash_delta_bwd(q, k, v, beta, U, do, M, scale=None, C=64):
             H=H, D=D, E=E, M=M, DV=DV, C=C, NC=NC,
         )
     dk = torch.zeros(B, H, T, D, device=q.device, dtype=torch.float32)
-    _dk_kernel[(B * H, NC)](
+    BN = C          # key-tile == chunk for now (correctness focus)
+    _dk_kernel[(B * H, triton.cdiv(T, BN))](
         q, k, v, beta, U, dbV, do, dk, dv, dbeta, s, T,
-        H=H, D=D, E=E, M=M, DV=DV, C=C, NC=NC, FOLD=fold,
+        H=H, D=D, E=E, M=M, DV=DV, C=C, BN=BN, FOLD=fold,
     )
     return dq, dk, dv, dbeta
 
@@ -797,10 +699,8 @@ class _FlashDelta(torch.autograd.Function):
         return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), db.to(beta.dtype), None, None, None
 
 
-def flash_delta(q, k, v, beta, M, scale=None, C=64, eps=1e-5):
+def flash_delta(q, k, v, beta, M, scale=None, C=64):
     """Trainable full-SPD delta with KATA denominator normalization: o = num / (den+eps),
     den_t = sum_{s<=t} A_qk[t,s]. den is detached (its gradient is a minor 2nd-order term);
     normalization bounds o to a weighted average of U -> stable training. No psi / no E^2 state."""
-    num = _FlashDelta.apply(q, k, v, beta, M, scale, C)
-    den = flash_delta_den(q, k, M, scale=scale, C=C)
-    return num / (den[..., None] + eps)
+    return _FlashDelta.apply(q, k, v, beta, M, scale, C)
