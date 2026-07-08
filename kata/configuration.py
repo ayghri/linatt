@@ -33,6 +33,7 @@ class KataConfig(PretrainedConfig):
         use_delta: bool = False,
         delta_scale: float = 0.5,
         delta_normalize: bool = False,
+        delta_state: bool = False,
         use_offset_gate: bool = False,
         use_decay: bool = False,
         feature_map_eps: float = 1e-6,
@@ -80,6 +81,7 @@ class KataConfig(PretrainedConfig):
         self.use_delta = use_delta
         self.delta_scale = delta_scale
         self.delta_normalize = delta_normalize
+        self.delta_state = delta_state
         self.use_offset_gate = use_offset_gate
         self.use_decay = use_decay
         self.feature_map_eps = feature_map_eps

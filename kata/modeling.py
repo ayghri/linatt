@@ -69,6 +69,7 @@ class KataBlock(GradientCheckpointingLayer):
                 use_delta=config.use_delta,
                 delta_scale=config.delta_scale,
                 delta_normalize=config.delta_normalize,
+                delta_state=config.delta_state,
                 use_offset_gate=config.use_offset_gate,
                 use_decay=config.use_decay,
                 feature_map_eps=config.feature_map_eps,

@@ -34,6 +34,7 @@ from kata.parallel_kata_attn import (
     parallel_kata_attn_sum_fwd_impl,
 )
 from kata.spd.flash_delta import flash_delta
+from kata.spd.chunk_state_v2 import flash_delta_state
 
 if TYPE_CHECKING:
     from fla.models.utils import Cache
@@ -56,6 +57,7 @@ class KataAttention(nn.Module):
         use_delta: bool = False,
         delta_scale: float = 0.5,
         delta_normalize: bool = False,
+        delta_state: bool = False,
         use_offset_gate: bool = False,
         use_decay: bool = False,
         feature_map_eps: float = 1e-6,
@@ -207,6 +209,7 @@ class KataAttention(nn.Module):
         self.use_delta = use_delta
         self.delta_scale = delta_scale   # A_kk_max = delta_scale^2; <1 keeps the erase inverse bounded
         self.delta_normalize = delta_normalize   # o=num/den with consistent bwd; default raw numerator
+        self.delta_state = delta_state   # O(T) chunked-state kernel (long ctx) vs O(T^2) flash
         if use_delta:
             self.b_proj = nn.Linear(hidden_size, num_heads, bias=False)
 
@@ -376,9 +379,13 @@ class KataAttention(nn.Module):
                 p = Tp - Tl
                 qh = F.pad(qh, (0, 0, 0, p)); kh = F.pad(kh, (0, 0, 0, p))
                 vh = F.pad(vh, (0, 0, 0, p)); bh = F.pad(bh, (0, p))
-            o = flash_delta(qh.bfloat16(), kh.bfloat16(), vh.bfloat16(),
-                            bh.bfloat16(), M, scale=self.delta_scale, C=C,
-                            normalize=self.delta_normalize)
+            if self.delta_state:                                         # O(T) state kernel (raw)
+                o = flash_delta_state(qh.bfloat16(), kh.bfloat16(), vh.bfloat16(),
+                                      bh.bfloat16(), M, scale=self.delta_scale, C=C)
+            else:
+                o = flash_delta(qh.bfloat16(), kh.bfloat16(), vh.bfloat16(),
+                                bh.bfloat16(), M, scale=self.delta_scale, C=C,
+                                normalize=self.delta_normalize)
             o = o[:, :, :Tl].transpose(1, 2).to(v.dtype)                 # (B,T,H,Dv)
             final_state = None
         elif self.feature_map_name in ("kata_quadratic", "kata_quadratic_sum"):
