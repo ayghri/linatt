@@ -1,0 +1,32 @@
+name: kataconv_cat2_340m
+# Matches /buckets/workspace/kataconv_cat2 checkpoint: kata concat-SPD M=2 attention,
+# with GDN-style SHORT CONV positional scheme instead of RoPE (use_rope=false).
+hf_kwargs:
+  model_type: kata
+  hidden_size: 1024
+  num_hidden_layers: 24
+  num_heads: 16
+  num_kv_heads: 16
+  expand_k: 1.0
+  expand_v: 1.0
+  feature_map: kata_quadratic     # concat-SPD score  Sum_i (q_i . k_i)^2
+  spd_num_groups: 2               # cat2
+  spd_use_kernel: false
+  qk_norm: true
+  norm_q: rmsnorm
+  norm_k: rmsnorm
+  use_short_conv: true            # GDN-style short conv (NO rope) -- the whole point
+  use_rope: false
+  rope_theta: 10000.0
+  rope_group: false
+  max_position_embeddings: 2048
+  hidden_ratio: 4
+  hidden_act: swish
+  norm_eps: 1.0e-6
+  tie_word_embeddings: true
+  fuse_norm: true
+  fuse_swiglu: true
+  fuse_cross_entropy: true
+  vocab_size: 32000
+  bos_token_id: 1
+  eos_token_id: 2

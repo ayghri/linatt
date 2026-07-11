@@ -125,11 +125,30 @@ def _patch_fla_attn_to_sdpa_flash() -> None:
                 )
         return o.transpose(1, 2).contiguous()
 
-    def _sdpa_flash_attn_varlen_func(*args, **kwargs):
-        raise NotImplementedError(
-            "varlen flash-attn is not supported by the SDPA shim; "
-            "set cu_seqlens=None or install flash-attn upstream."
-        )
+    def _sdpa_flash_attn_varlen_func(q, k, v, cu_seqlens_q=None, cu_seqlens_k=None,
+                                     max_seqlen_q=None, max_seqlen_k=None,
+                                     dropout_p=0.0, softmax_scale=None, causal=False,
+                                     window_size=(-1, -1), **kwargs):
+        # Unpadded varlen: q,k,v are (total_tokens, H, D); cu_seqlens delimit sequences.
+        # Loop each sequence -> SDPA. Handles prefill (Tq==Tk, plain causal) AND decode
+        # (Tq<Tk: query i attends keys 0..(Tk-Tq+i), i.e. tril shifted by Tk-Tq).
+        cq = cu_seqlens_q.tolist()
+        ck = cu_seqlens_k.tolist()
+        outs = []
+        for i in range(len(cq) - 1):
+            qi = q[cq[i]:cq[i + 1]].transpose(0, 1).unsqueeze(0)   # (1,H,Tq,D)
+            ki = k[ck[i]:ck[i + 1]].transpose(0, 1).unsqueeze(0)
+            vi = v[ck[i]:ck[i + 1]].transpose(0, 1).unsqueeze(0)
+            Tq, Tk = qi.shape[2], ki.shape[2]
+            if causal and Tq != Tk:
+                m = torch.ones(Tq, Tk, dtype=torch.bool, device=q.device).tril(diagonal=Tk - Tq)
+                oi = F.scaled_dot_product_attention(qi, ki, vi, attn_mask=m,
+                                                    dropout_p=dropout_p, scale=softmax_scale)
+            else:
+                oi = F.scaled_dot_product_attention(qi, ki, vi, is_causal=causal,
+                                                    dropout_p=dropout_p, scale=softmax_scale)
+            outs.append(oi.squeeze(0).transpose(0, 1))            # (Tq,H,D)
+        return torch.cat(outs, dim=0)
 
     _attn.flash_attn_func = _sdpa_flash_attn_func
     _attn.flash_attn_varlen_func = _sdpa_flash_attn_varlen_func

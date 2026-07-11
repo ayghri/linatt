@@ -10,7 +10,7 @@ work out of the box.
 from __future__ import annotations
 
 # Lightweight, no-transformers imports always available
-from kata.feature_maps import FeatureMap, positive, lorentz, spd_concat
+from kata.references.feature_maps import FeatureMap, positive, lorentz, spd_concat
 
 # Heavy imports (transformers/fla.models) loaded only when actually accessed,
 # so kernel-only consumers (kata.spd_kernels, benchmarks) don't pay the cost.

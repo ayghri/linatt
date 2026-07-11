@@ -143,17 +143,15 @@ class _StateDelta(torch.autograd.Function):
     backward exists. Inference/no-grad runs the O(T) forward only."""
     @staticmethod
     def forward(ctx, q, k, v, beta, M, scale, C):
-        o = spd_delta_state_v2(q, k, v, beta, M, scale=scale, C=C)
-        ctx.save_for_backward(q, k, v, beta)
+        o, U, S = spd_delta_state_v2(q, k, v, beta, M, scale=scale, C=C, return_us=True)
+        ctx.save_for_backward(q, k, v, beta, U, S)      # S = final state, backward clones it
         ctx.M, ctx.scale, ctx.C = M, scale, C
         return o
 
     @staticmethod
     def backward(ctx, do):
-        from .flash_delta import flash_delta_U, flash_delta_bwd
-        q, k, v, beta = ctx.saved_tensors
-        U = flash_delta_U(q, k, v, beta, ctx.M, scale=ctx.scale, C=ctx.C)     # O(T^2) recompute
-        dq, dk, dv, db = flash_delta_bwd(q, k, v, beta, U, do, ctx.M, ctx.scale, ctx.C)
+        q, k, v, beta, U, S = ctx.saved_tensors
+        dq, dk, dv, db = spd_delta_state_bwd(q, k, v, beta, do, U, S, ctx.M, scale=ctx.scale, C=ctx.C)
         return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), db.to(beta.dtype), None, None, None
 
 
