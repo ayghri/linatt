@@ -85,7 +85,9 @@ class KataAttention(nn.Module):
         self.hidden_size = hidden_size
         self.mode = mode
         self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.num_kv_heads = (
+            num_kv_heads if num_kv_heads is not None else num_heads
+        )
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.key_dim = int(hidden_size * expand_k)
         self.value_dim = int(hidden_size * expand_v)
@@ -168,7 +170,9 @@ class KataAttention(nn.Module):
 
         self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.key_dim_per_group, bias=False)
-        self.v_proj = nn.Linear(hidden_size, self.value_dim_per_group, bias=False)
+        self.v_proj = nn.Linear(
+            hidden_size, self.value_dim_per_group, bias=False
+        )
 
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
@@ -207,9 +211,11 @@ class KataAttention(nn.Module):
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
         # SPD delta-rule (content-based erase via the flash kernel); psi/state never formed.
         self.use_delta = use_delta
-        self.delta_scale = delta_scale   # A_kk_max = delta_scale^2; <1 keeps the erase inverse bounded
-        self.delta_normalize = delta_normalize   # o=num/den with consistent bwd; default raw numerator
-        self.delta_state = delta_state   # O(T) chunked-state kernel (long ctx) vs O(T^2) flash
+        self.delta_scale = delta_scale  # A_kk_max = delta_scale^2; <1 keeps the erase inverse bounded
+        self.delta_normalize = delta_normalize  # o=num/den with consistent bwd; default raw numerator
+        self.delta_state = (
+            delta_state  # O(T) chunked-state kernel (long ctx) vs O(T^2) flash
+        )
         if use_delta:
             self.b_proj = nn.Linear(hidden_size, num_heads, bias=False)
 
@@ -262,7 +268,8 @@ class KataAttention(nn.Module):
     def _augment_offset(self, q, k, off):
         """Per-token, per-head additive offset: append off_t to each group of q and a
         constant 1 to each group of k (zero-pad the group to a power-of-2 dim), so the
-        squared-dot kernel yields (<q_i,k_i> + off_t)^2 per group. off: (B,T,H)."""
+        squared-dot kernel yields (<q_i,k_i> + off_t)^2 per group. off: (B,T,H).
+        """
         B, T, H, _ = q.shape
         M, E, Ep = self.spd_num_groups, self._off_E, self._off_Epad
 
@@ -280,13 +287,15 @@ class KataAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values: "Cache | None" = None,
         use_cache: bool | None = False,
-        output_attentions: bool | None = False,
         **kwargs,
     ):
         # short prefill / decode -> recurrent kernel; long -> requested chunked path.
         mode = "fused_recurrent" if hidden_states.shape[1] <= 64 else self.mode
         last_state = get_layer_cache(self, past_key_values)
 
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
         if self.use_short_conv:
             conv_state_q = conv_state_k = conv_state_v = None
             if last_state is not None:
@@ -294,24 +303,20 @@ class KataAttention(nn.Module):
                     "conv_state", (None, None, None)
                 )
             q, conv_state_q = self.q_conv1d(
-                x=self.q_proj(hidden_states),
+                x=q,
                 cache=conv_state_q,
                 output_final_state=use_cache,
             )
             k, conv_state_k = self.k_conv1d(
-                x=self.k_proj(hidden_states),
+                x=k,
                 cache=conv_state_k,
                 output_final_state=use_cache,
             )
             v, conv_state_v = self.v_conv1d(
-                x=self.v_proj(hidden_states),
+                x=v,
                 cache=conv_state_v,
                 output_final_state=use_cache,
             )
-        else:
-            q = self.q_proj(hidden_states)
-            k = self.k_proj(hidden_states)
-            v = self.v_proj(hidden_states)
 
         if attention_mask is not None:
             v = v.mul(attention_mask[:, -v.shape[-2] :, None])
@@ -345,7 +350,9 @@ class KataAttention(nn.Module):
             seqlen_offset = 0
             if past_key_values is not None and self.layer_idx is not None:
                 seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
-            max_seqlen = max(q.shape[1] + seqlen_offset, self.max_position_embeddings)
+            max_seqlen = max(
+                q.shape[1] + seqlen_offset, self.max_position_embeddings
+            )
             if self.rope_group:
                 # treat each E-dim group as its own head: (B,T,H,D) -> (B,T,H*M,E),
                 # rotate with RotaryEmbedding(dim=E), reshape back.
@@ -369,24 +376,47 @@ class KataAttention(nn.Module):
         )
         if self.use_delta:
             # SPD delta-rule via the flash kernel: content erase (k_s.k_t)^2, no psi/state.
-            beta = torch.sigmoid(self.b_proj(hidden_states))              # (B,T,H)
+            beta = torch.sigmoid(self.b_proj(hidden_states))  # (B,T,H)
             M, C = self.spd_num_groups, 64
-            qh = q.transpose(1, 2).contiguous(); kh = k.transpose(1, 2).contiguous()
-            vh = v.transpose(1, 2).contiguous(); bh = beta.transpose(1, 2).contiguous()
-            Tl = qh.shape[2]
-            Tp = max(C, 1 << (Tl - 1).bit_length())                      # pow2 -> few autotune keys
+            # TIME-MAJOR: flash_delta consumes (B,T,H,D) directly -- no transpose in/out.
+            Tl = q.shape[1]
+            Tp = max(C, 1 << (Tl - 1).bit_length())  # pow2 -> few autotune keys
+            qh, kh, vh, bh = (
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                beta.contiguous(),
+            )
             if Tp != Tl:
                 p = Tp - Tl
-                qh = F.pad(qh, (0, 0, 0, p)); kh = F.pad(kh, (0, 0, 0, p))
-                vh = F.pad(vh, (0, 0, 0, p)); bh = F.pad(bh, (0, p))
-            if self.delta_state:                                         # O(T) state kernel (raw)
-                o = flash_delta_state(qh.bfloat16(), kh.bfloat16(), vh.bfloat16(),
-                                      bh.bfloat16(), M, scale=self.delta_scale, C=C)
+                qh = F.pad(qh, (0, 0, 0, 0, 0, p))
+                kh = F.pad(kh, (0, 0, 0, 0, 0, p))
+                vh = F.pad(vh, (0, 0, 0, 0, 0, p))
+                bh = F.pad(bh, (0, 0, 0, p))
+            if (
+                self.delta_state
+            ):  # O(T) state kernel (still head-major; unused by trained models)
+                o = flash_delta_state(
+                    qh.transpose(1, 2).bfloat16(),
+                    kh.transpose(1, 2).bfloat16(),
+                    vh.transpose(1, 2).bfloat16(),
+                    bh.transpose(1, 2).bfloat16(),
+                    M,
+                    scale=self.delta_scale,
+                    C=C,
+                ).transpose(1, 2)
             else:
-                o = flash_delta(qh.bfloat16(), kh.bfloat16(), vh.bfloat16(),
-                                bh.bfloat16(), M, scale=self.delta_scale, C=C,
-                                normalize=self.delta_normalize)
-            o = o[:, :, :Tl].transpose(1, 2).to(v.dtype)                 # (B,T,H,Dv)
+                o = flash_delta(
+                    qh.bfloat16(),
+                    kh.bfloat16(),
+                    vh.bfloat16(),
+                    bh.bfloat16(),
+                    M,
+                    scale=self.delta_scale,
+                    C=C,
+                    normalize=self.delta_normalize,
+                )
+            o = o[:, :Tl].to(v.dtype)  # (B,T,H,Dv) -- already time-major
             final_state = None
         elif self.feature_map_name in ("kata_quadratic", "kata_quadratic_sum"):
             # FlashAttention-style quadratic kata; psi never materialized.
@@ -410,7 +440,11 @@ class KataAttention(nn.Module):
                 dt = F.softplus(
                     self.dt_proj(hidden_states) + self.dt_bias
                 )  # (B,T,H) >0
-                c = (-self.A_log.float().exp() * dt.float()).cumsum(dim=1).contiguous()
+                c = (
+                    (-self.A_log.float().exp() * dt.float())
+                    .cumsum(dim=1)
+                    .contiguous()
+                )
                 o = parallel_kata_attn_decay(
                     q_in,
                     k_in,
@@ -458,11 +492,13 @@ class KataAttention(nn.Module):
             final_state = None
         else:
             # pre-materialize psi(q), psi(k) and route through FLA kernels
-            q = self.feature_map(q)
-            k = self.feature_map(k)
-            if self.qk_norm:  # legacy psi-feature sum-norm (positive/lorentz maps)
+            if (
+                self.qk_norm
+            ):  # legacy psi-feature sum-norm (positive/lorentz maps)
                 q = q / (q.sum(-1, True) + 1e-4)
                 k = k / (k.sum(-1, True) + 1e-4)
+            q = self.feature_map(q)
+            k = self.feature_map(k)
             if mode == "chunk":
                 o, final_state = chunk_linear_attn(
                     q=q,
@@ -504,3 +540,115 @@ class KataAttention(nn.Module):
         o = rearrange(o, "... h d -> ... (h d)")
         o = self.o_proj(o)
         return o, None, past_key_values
+
+
+# ---------------------------------------------------------------------------
+# Named mixer layers. KataAttention above is the shared implementation (all the
+# projections, conv, qk-norm, RoPE, cache) and dispatches in `forward` on the
+# config flags. The three subclasses below pin exactly one token-mixer path so
+# configs and checkpoints are self-documenting; each only validates the config
+# and delegates to KataAttention, so state_dicts are interchangeable.
+# ---------------------------------------------------------------------------
+class FlashKata(KataAttention):
+    """Flash-KATA -- $\\gO(T^2)$ FlashAttention-style KATA-SPD (the trained KATA-SPD $M{=}1,2$).
+
+    Runs the fused ``parallel_kata_attn`` kernel: the SPD score is computed flash-attention
+    style so neither the $\\psi$ feature nor the $E^2$ state is ever materialized. Supports
+    ``kata_quadratic`` (concat, $\\sum_g(q_g\\!\\cdot\\!k_g)^2$) and ``kata_quadratic_sum``
+    (sum, $\\sum_{g,h}(q_g\\!\\cdot\\!k_h)^2$), plus the optional offset gate / GDN-style decay.
+    """
+
+    def __init__(
+        self,
+        *,
+        feature_map: str = "kata_quadratic",
+        use_delta: bool = False,
+        **kw,
+    ):
+        if feature_map not in ("kata_quadratic", "kata_quadratic_sum"):
+            raise ValueError(
+                "FlashKata requires feature_map in {kata_quadratic, kata_quadratic_sum}; "
+                f"got {feature_map!r} (use ChunkedKata for the linear feature maps)."
+            )
+        if use_delta:
+            raise ValueError(
+                "FlashKata is the non-delta flash kernel; use DeltaKata for the erase."
+            )
+        super().__init__(feature_map=feature_map, use_delta=False, **kw)
+
+
+class ChunkedKata(KataAttention):
+    """Chunked-KATA -- $\\gO(T)$ chunked linear-attention KATA (KATA-SSM family).
+
+    Pre-materializes $\\psi(q),\\psi(k)$ for a positive / Lorentz / SPD-packed feature map and
+    runs FLA's ``chunk_linear_attn`` (``fused_chunk`` / ``fused_recurrent`` for short prefill
+    and decode). Linear in $T$ with a fixed feature-dimension recurrent state.
+    """
+
+    def __init__(
+        self, *, feature_map: str = "spd_concat", use_delta: bool = False, **kw
+    ):
+        if feature_map in ("kata_quadratic", "kata_quadratic_sum"):
+            raise ValueError(
+                f"ChunkedKata is the $\\gO(T)$ linear path; feature_map={feature_map!r} is the "
+                "quadratic flash kernel -- use FlashKata."
+            )
+        if use_delta:
+            raise ValueError("ChunkedKata has no content erase; use DeltaKata.")
+        super().__init__(feature_map=feature_map, use_delta=False, **kw)
+
+
+class DeltaKata(KataAttention):
+    """Delta-KATA -- SPD delta-rule KATA (DeltaKATA in the paper).
+
+    Adds a content-based erase (the DeltaNet rule with the SPD $(k_s\\!\\cdot\\!k_t)^2$ kernel):
+    ``flash_delta`` ($\\gO(T^2)$-compute, no $E^2$ state) by default, or ``flash_delta_state``
+    ($\\gO(T)$ HBM state) with ``delta_state=True``. Learns per-token $\\beta$ from ``b_proj``.
+    """
+
+    def __init__(self, *, use_delta: bool = True, **kw):
+        super().__init__(use_delta=True, **kw)
+
+
+def build_kata_mixer(config, layer_idx: int | None = None) -> KataAttention:
+    """Instantiate the right KATA mixer from a ``KataConfig``: ``DeltaKata`` when ``use_delta``,
+    else ``FlashKata`` for the quadratic (flash) feature maps, else ``ChunkedKata`` for the
+    linear/psi feature maps. All three share ``KataAttention.__init__``, so this is a pure
+    dispatch and checkpoints remain interchangeable."""
+    kw = dict(
+        mode=config.attn_mode,
+        hidden_size=config.hidden_size,
+        expand_k=config.expand_k,
+        expand_v=config.expand_v,
+        num_heads=config.num_heads,
+        num_kv_heads=config.num_kv_heads,
+        feature_map=config.feature_map,
+        spd_num_groups=config.spd_num_groups,
+        spd_use_kernel=config.spd_use_kernel,
+        spd_chunk_size=config.spd_chunk_size,
+        use_delta=config.use_delta,
+        delta_scale=config.delta_scale,
+        delta_normalize=config.delta_normalize,
+        delta_state=config.delta_state,
+        use_offset_gate=config.use_offset_gate,
+        use_decay=config.use_decay,
+        feature_map_eps=config.feature_map_eps,
+        qk_norm=config.qk_norm,
+        norm_q=config.norm_q,
+        norm_k=config.norm_k,
+        use_short_conv=config.use_short_conv,
+        conv_size=config.conv_size,
+        conv_bias=config.conv_bias,
+        use_rope=config.use_rope,
+        rope_theta=config.rope_theta,
+        rope_group=config.rope_group,
+        max_position_embeddings=config.max_position_embeddings,
+        elementwise_affine=config.elementwise_affine,
+        norm_eps=config.norm_eps,
+        layer_idx=layer_idx,
+    )
+    if config.use_delta:
+        return DeltaKata(**kw)
+    if config.feature_map in ("kata_quadratic", "kata_quadratic_sum"):
+        return FlashKata(**kw)
+    return ChunkedKata(**kw)

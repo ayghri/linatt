@@ -24,7 +24,7 @@ def apply() -> None:
     if _APPLIED:
         return
 
-    _register_kata()            # import kata so its CausalLM class exists to patch
+    _register_kata()  # import kata so its CausalLM class exists to patch
     _patch_tied_weights_keys()  # version-aware: list (tf<5) vs dict (tf>=5)
     _patch_fla_attn_to_sdpa_flash()
 
@@ -49,7 +49,9 @@ def _patch_tied_weights_keys() -> None:
 
     major = int(transformers.__version__.split(".")[0])
     if major < 5:
-        if list(getattr(Mamba2ForCausalLM, "_tied_weights_keys", []) or []) != ["lm_head.weight"]:
+        if list(getattr(Mamba2ForCausalLM, "_tied_weights_keys", []) or []) != [
+            "lm_head.weight"
+        ]:
             Mamba2ForCausalLM._tied_weights_keys = ["lm_head.weight"]
         return
 
@@ -57,8 +59,11 @@ def _patch_tied_weights_keys() -> None:
     # Source path differs by base-model attr: most fla models use
     # self.model.embeddings; mamba2 uses self.backbone.embeddings.
     from fla.models.transformer.modeling_transformer import TransformerForCausalLM
-    from fla.models.gated_deltanet.modeling_gated_deltanet import GatedDeltaNetForCausalLM
+    from fla.models.gated_deltanet.modeling_gated_deltanet import (
+        GatedDeltaNetForCausalLM,
+    )
     from fla.models.delta_net.modeling_delta_net import DeltaNetForCausalLM
+
     specs = [
         (TransformerForCausalLM, "model.embeddings.weight"),
         (GatedDeltaNetForCausalLM, "model.embeddings.weight"),
@@ -67,6 +72,7 @@ def _patch_tied_weights_keys() -> None:
     ]
     try:
         from kata.modeling import KataForCausalLM
+
         specs.append((KataForCausalLM, "model.embeddings.weight"))
     except Exception:
         pass
@@ -83,6 +89,7 @@ def _register_kata() -> None:
     touch a lazy symbol here. Accessing kata.KataConfig forces the registration.
     """
     import kata  # noqa: F401
+
     _ = kata.KataConfig  # triggers __getattr__ -> _maybe_register (Auto* registration)
 
 
@@ -102,8 +109,16 @@ def _patch_fla_attn_to_sdpa_flash() -> None:
     import torch.nn.functional as F
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
-    def _sdpa_flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None,
-                              causal=False, window_size=(-1, -1), **kwargs):
+    def _sdpa_flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        **kwargs,
+    ):
         # flash_attn convention: (B, T, H, D); SDPA wants (B, H, T, D).
         q_ = q.transpose(1, 2)
         k_ = k.transpose(1, 2)
@@ -114,21 +129,39 @@ def _patch_fla_attn_to_sdpa_flash() -> None:
             # doesn't use windows so this branch is unused here.
             with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
                 o = F.scaled_dot_product_attention(
-                    q_, k_, v_, is_causal=causal, dropout_p=dropout_p,
+                    q_,
+                    k_,
+                    v_,
+                    is_causal=causal,
+                    dropout_p=dropout_p,
                     scale=softmax_scale,
                 )
         else:
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                 o = F.scaled_dot_product_attention(
-                    q_, k_, v_, is_causal=causal, dropout_p=dropout_p,
+                    q_,
+                    k_,
+                    v_,
+                    is_causal=causal,
+                    dropout_p=dropout_p,
                     scale=softmax_scale,
                 )
         return o.transpose(1, 2).contiguous()
 
-    def _sdpa_flash_attn_varlen_func(q, k, v, cu_seqlens_q=None, cu_seqlens_k=None,
-                                     max_seqlen_q=None, max_seqlen_k=None,
-                                     dropout_p=0.0, softmax_scale=None, causal=False,
-                                     window_size=(-1, -1), **kwargs):
+    def _sdpa_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=None,
+        max_seqlen_k=None,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        **kwargs,
+    ):
         # Unpadded varlen: q,k,v are (total_tokens, H, D); cu_seqlens delimit sequences.
         # Loop each sequence -> SDPA. Handles prefill (Tq==Tk, plain causal) AND decode
         # (Tq<Tk: query i attends keys 0..(Tk-Tq+i), i.e. tril shifted by Tk-Tq).
@@ -136,18 +169,27 @@ def _patch_fla_attn_to_sdpa_flash() -> None:
         ck = cu_seqlens_k.tolist()
         outs = []
         for i in range(len(cq) - 1):
-            qi = q[cq[i]:cq[i + 1]].transpose(0, 1).unsqueeze(0)   # (1,H,Tq,D)
-            ki = k[ck[i]:ck[i + 1]].transpose(0, 1).unsqueeze(0)
-            vi = v[ck[i]:ck[i + 1]].transpose(0, 1).unsqueeze(0)
+            qi = q[cq[i] : cq[i + 1]].transpose(0, 1).unsqueeze(0)  # (1,H,Tq,D)
+            ki = k[ck[i] : ck[i + 1]].transpose(0, 1).unsqueeze(0)
+            vi = v[ck[i] : ck[i + 1]].transpose(0, 1).unsqueeze(0)
             Tq, Tk = qi.shape[2], ki.shape[2]
             if causal and Tq != Tk:
-                m = torch.ones(Tq, Tk, dtype=torch.bool, device=q.device).tril(diagonal=Tk - Tq)
-                oi = F.scaled_dot_product_attention(qi, ki, vi, attn_mask=m,
-                                                    dropout_p=dropout_p, scale=softmax_scale)
+                m = torch.ones(Tq, Tk, dtype=torch.bool, device=q.device).tril(
+                    diagonal=Tk - Tq
+                )
+                oi = F.scaled_dot_product_attention(
+                    qi, ki, vi, attn_mask=m, dropout_p=dropout_p, scale=softmax_scale
+                )
             else:
-                oi = F.scaled_dot_product_attention(qi, ki, vi, is_causal=causal,
-                                                    dropout_p=dropout_p, scale=softmax_scale)
-            outs.append(oi.squeeze(0).transpose(0, 1))            # (Tq,H,D)
+                oi = F.scaled_dot_product_attention(
+                    qi,
+                    ki,
+                    vi,
+                    is_causal=causal,
+                    dropout_p=dropout_p,
+                    scale=softmax_scale,
+                )
+            outs.append(oi.squeeze(0).transpose(0, 1))  # (Tq,H,D)
         return torch.cat(outs, dim=0)
 
     _attn.flash_attn_func = _sdpa_flash_attn_func

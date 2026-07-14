@@ -32,7 +32,9 @@ import fla  # noqa: F401  -- registers fla model_types
 import fla_patches  # noqa: F401  -- kata + SDPA shim
 from eval_ckpt import load_model, step_of, to_plain
 
-DEFAULT_TOKENIZER = "TinyLlama/TinyLlama_v1.1"   # the tokenizer the 340m models trained with
+DEFAULT_TOKENIZER = (
+    "TinyLlama/TinyLlama_v1.1"  # the tokenizer the 340m models trained with
+)
 
 
 def _apply_yarn(model, scale, orig_max_pos, beta_fast=32, beta_slow=1):
@@ -46,12 +48,19 @@ def _apply_yarn(model, scale, orig_max_pos, beta_fast=32, beta_slow=1):
         freqs = base ** (torch.arange(0, dim, 2, dtype=torch.float32)[:d2] / dim)
         inv_extrap = 1.0 / freqs
         inv_interp = 1.0 / (scale * freqs)
-        find = lambda nr: (dim * math.log(orig_max_pos / (nr * 2 * math.pi))) / (2 * math.log(base))
-        low, high = max(math.floor(find(beta_fast)), 0), min(math.ceil(find(beta_slow)), dim - 1)
+        find = lambda nr: (
+            (dim * math.log(orig_max_pos / (nr * 2 * math.pi))) / (2 * math.log(base))
+        )
+        low, high = (
+            max(math.floor(find(beta_fast)), 0),
+            min(math.ceil(find(beta_slow)), dim - 1),
+        )
         if low == high:
             high += 0.001
-        ramp = torch.clamp((torch.arange(d2, dtype=torch.float32) - low) / (high - low), 0, 1)
-        mask = 1 - ramp                                   # 1=extrapolate (high freq), 0=interpolate
+        ramp = torch.clamp(
+            (torch.arange(d2, dtype=torch.float32) - low) / (high - low), 0, 1
+        )
+        mask = 1 - ramp  # 1=extrapolate (high freq), 0=interpolate
         return inv_interp * (1 - mask) + inv_extrap * mask
 
     n = 0
@@ -60,10 +69,11 @@ def _apply_yarn(model, scale, orig_max_pos, beta_fast=32, beta_slow=1):
         if rot is None:
             continue
         rot.inv_freq.copy_(yarn_inv_freq(rot.dim, rot.base).to(rot.inv_freq.device))
-        rot._seq_len_cached = 0                           # force cos/sin recompute with new freqs
+        rot._seq_len_cached = 0  # force cos/sin recompute with new freqs
         rot._cos_cached = rot._sin_cached = rot._cos_k_cached = rot._sin_k_cached = None
         n += 1
     return n
+
 
 # Arora'24b (Based) cloze/completion recall tasks: next-word-prediction formatting that
 # works on BASE (non-instruction-tuned) models, matching the GDN paper's setup. These are
@@ -82,7 +92,9 @@ def _apply_yarn(model, scale, orig_max_pos, beta_fast=32, beta_slow=1):
 # based_triviaqa/based_nq are the Arora'24 in-context cloze versions (recall_tasks/), NOT
 # lm-eval's stock triviaqa/nq_open which are CLOSED-BOOK (rc.nocontext) -> ~0 at 340M.
 RECALL_TASKS = ["swde", "fda", "squad_completion", "drop", "based_triviaqa", "based_nq"]
-_CUSTOM_TASK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recall_tasks")
+_CUSTOM_TASK_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "recall_tasks"
+)
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="main.yaml")
@@ -112,6 +124,7 @@ def main(cfg: DictConfig) -> None:
     import lm_eval
     from lm_eval.models.huggingface import HFLM
     from lm_eval.tasks import TaskManager
+
     # metadata (tokenizer + niah lengths) MUST go to the TaskManager -- when a custom task_manager
     # is passed to simple_evaluate, its metadata= arg is ignored, so NIAH loses its tokenizer.
     task_manager = TaskManager(include_path=_CUSTOM_TASK_DIR, metadata=metadata)
@@ -126,13 +139,17 @@ def main(cfg: DictConfig) -> None:
     no_cache = getattr(model.config, "model_type", "") == "kata"
     if no_cache:
         _orig_generate = model.generate
-        model.generate = lambda *a, **kw: _orig_generate(*a, **{**kw, "use_cache": False})
-    yarn = cfg.eval.get("rope_yarn", None)               # extend RoPE ctx (e.g. 4 -> 2048->8192)
+        model.generate = lambda *a, **kw: _orig_generate(
+            *a, **{**kw, "use_cache": False}
+        )
+    yarn = cfg.eval.get("rope_yarn", None)  # extend RoPE ctx (e.g. 4 -> 2048->8192)
     if yarn:
         n = _apply_yarn(model, float(yarn), 2048)
-        print(f"  [yarn] scale={yarn} applied to {n} rotaries (2048 -> {int(2048 * float(yarn))} ctx)")
+        print(
+            f"  [yarn] scale={yarn} applied to {n} rotaries (2048 -> {int(2048 * float(yarn))} ctx)"
+        )
     print(
-        f"[recall] {os.path.basename(path)}  step={step}  tokens={tokens/1e9:.2f}B  "
+        f"[recall] {os.path.basename(path)}  step={step}  tokens={tokens / 1e9:.2f}B  "
         f"tasks={tasks}{'  (KATA: use_cache=False, no attn KV-cache)' if no_cache else ''}"
     )
     # NIAH haystacks (up to max(niah_lengths)) exceed the 2048 train ctx. HFLM defaults max_length
@@ -140,8 +157,18 @@ def main(cfg: DictConfig) -> None:
     # -> the needle gets chopped off -> 4K/8K scores collapse to the truncation-survival probability,
     # NOT real recall. Set max_length to fit the whole haystack so the model sees the full context
     # (GDN/linear-attn extrapolate; RoPE models like KATA still process it, just OOD at long range).
-    max_len = max(niah_lengths) + 256 if any("niah" in t or "ruler" in t for t in tasks) else None
-    lm = HFLM(pretrained=model, tokenizer=tok, batch_size=batch_size, device=device, max_length=max_len)
+    max_len = (
+        max(niah_lengths) + 256
+        if any("niah" in t or "ruler" in t for t in tasks)
+        else None
+    )
+    lm = HFLM(
+        pretrained=model,
+        tokenizer=tok,
+        batch_size=batch_size,
+        device=device,
+        max_length=max_len,
+    )
 
     out_path = os.path.join(output_dir, f"eval_recall_step_{step}.yaml")
     results = {"step": step, "tokens_seen": tokens, "tasks": {}}
@@ -163,14 +190,21 @@ def main(cfg: DictConfig) -> None:
         try:
             with torch.inference_mode():
                 res = lm_eval.simple_evaluate(
-                    model=lm, tasks=[task], batch_size=batch_size,
-                    device=device, metadata=metadata, task_manager=task_manager,
-                    limit=cfg.eval.get('limit', None),
+                    model=lm,
+                    tasks=[task],
+                    batch_size=batch_size,
+                    device=device,
+                    metadata=metadata,
+                    task_manager=task_manager,
+                    limit=cfg.eval.get("limit", None),
                 )
             m = to_plain(res["results"].get(task, {}))
             head = (
-                m.get("acc,none") or m.get("exact_match,none")
-                or m.get("contains,none") or m.get("score,none") or "done"
+                m.get("acc,none")
+                or m.get("exact_match,none")
+                or m.get("contains,none")
+                or m.get("score,none")
+                or "done"
             )
             print(f"  {task} -> {head}")
         except Exception as e:

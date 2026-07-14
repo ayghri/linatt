@@ -1,47 +1,26 @@
-"""KATA-SPD attention: flash (O(T^2)) and chunked (O(T*E^2)) kernels.
+"""KATA-SPD attention kernels.
 
-SPD score (q,k split into M groups of width E = d_head/M):
-  concat: A[t,s] = sum_i  (q_i . k_i)^2
-  sum:    A[t,s] = sum_ij (q_i . k_j)^2
-sum-normalized (no softmax). Two compute strategies, cleanly separated:
+Only the kernels actually used by the models / paper are imported here, so this
+file doubles as the manifest of what's live.
 
-  flash (kata.spd.flash)  - O(T^2) parallel, trainable (fwd+bwd). Best at the
-                            training/short-context regime.
-  chunk (kata.spd.chunk)  - O(T*E^2) stateful, bf16 tensor-core. Wins at long
-                            context (T >> chunk size); forward only for now.
-
-Public API:
-  spd_flash(q,k,v,M,mode,scale)          -> o            (differentiable)
-  spd_flash_fwd(q,k,v,M,mode,scale,...)  -> (o, den)     (forward only)
-  spd_chunk(q,k,v,M,mode,scale,C)        -> (o, den)     (bf16 chunked fwd)
-  spd_chunk_fp32(...)                    -> (o, den)     (fp32 chunked fwd)
-  references: spd_parallel_ref, spd_recurrent_ref, spd_chunked_ref,
-              psi_concat, psi_sum, spd_scores
+  flash_delta        (kata.spd.flash_delta)      -- DeltaKATA: O(T^2) scalar-kernel delta, no E^2 state
+  flash_delta_state  (kata.spd.chunk_state_v2)   -- KATA-SSM (delta): O(T) HBM-state SPD delta
+  spd_state_lin      (kata.spd.chunk_state_lin)  -- KATA-SSM (linear): O(T) 3-chain chunked-state,
+                                                    fwd + O(T) 2-pass backward (differentiable); the
+                                                    fast paper-benchmark kernel (1.4-1.6x flash_delta_state)
+  spd_chunk_scan     (kata.spd.chunk_scan)       -- sum-mode parallel-prefix tree-scan
+  spd_chunk_scan_cat (kata.spd.chunk_scan_cat)   -- concat/linear-feature tree-scan
 """
-from .reference import (
-    psi_concat,
-    psi_sum,
-    spd_scores,
-    spd_parallel_ref,
-    spd_recurrent_ref,
-    spd_chunked_ref,
-)
-from .flash import spd_attn_parallel as spd_flash
-from .flash import spd_attn_parallel_fwd as spd_flash_fwd
-from .chunk import spd_attn_chunked_fast as spd_chunk
-from .chunk_fp32 import spd_attn_chunked_fwd as spd_chunk_fp32
-from .chunk_scan import spd_chunk_scan as spd_chunk_tree
+from .flash_delta import flash_delta
+from .chunk_state_v2 import flash_delta_state
+from .chunk_state_lin import spd_state_lin
+from .chunk_scan import spd_chunk_scan
+from .chunk_scan_cat import spd_chunk_scan_cat
 
 __all__ = [
-    "spd_flash",
-    "spd_flash_fwd",
-    "spd_chunk",
-    "spd_chunk_fp32",
-    "spd_chunk_tree",
-    "psi_concat",
-    "psi_sum",
-    "spd_scores",
-    "spd_parallel_ref",
-    "spd_recurrent_ref",
-    "spd_chunked_ref",
+    "flash_delta",
+    "flash_delta_state",
+    "spd_state_lin",
+    "spd_chunk_scan",
+    "spd_chunk_scan_cat",
 ]

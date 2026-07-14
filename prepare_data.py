@@ -13,14 +13,12 @@ import multiprocessing as mp
 import os
 
 import hydra
-import torch
 from datasets import Dataset, load_dataset
 from omegaconf import DictConfig, OmegaConf
 from transformers import AutoTokenizer, logging as hf_logging
 
 
 class ShardedDatasetStream:
-
     def __init__(
         self,
         dataset_name,

@@ -1,30 +1,4 @@
-"""KATA feature maps psi: R^d -> R^q.
-
-These are nonnegative finite feature maps used in place of softmax for linear
-attention. The choice of psi controls the cone the attention weights live in
-and, per the paper, the recall capacity under the Welch floor.
-
-Implementations are pure torch v1; matched-precision triton variants land in a
-later iteration once the LM-scale wiring is validated.
-
-Variants
---------
-positive
-    psi(x) = relu(x) + eps. Output dim q = d.
-lorentz
-    psi(x) = [x[..., :d-1], ||x[..., :d-1]|| * (1 + x[..., d-1]**2)]. q = d.
-    Image lies on the Lorentz cone {x_d >= ||x_{1..d-1}||}.
-spd_concat
-    Split x in R^d into M groups of E = d/M dims. For each group g_i,
-    return the lower-triangle of g_i g_i^T (E*(E+1)/2 entries). Concat over M
-    groups. Output dim q = M * E*(E+1)/2.
-    The off-diagonals are scaled by sqrt(2) so that <psi(x), psi(y)> equals
-    sum_i <g_i, h_i>**2 -- the squared inner product per group.
-
-All maps are nonnegative when they need to be (positive: yes; lorentz: yes
-because the last coord dominates; spd_concat: diagonals are nonneg, and
-nonnegativity of <psi(x), psi(y)> follows from <g_i,h_i>**2 >= 0).
-"""
+"""KATA feature maps psi: R^d -> R^p."""
 
 import math
 
@@ -37,13 +11,22 @@ def positive(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 def lorentz(x: torch.Tensor) -> torch.Tensor:
+    """lorentz
+        psi(x) = [x[..., :d-1], ||x[..., :d-1]|| * (1 + x[..., d-1]**2)]. q = d.
+        Image lies on the Lorentz cone {x_d >= ||x_{1..d-1}||}.
+    spd_concat
+        Split x in R^d into M groups of E = d/M dims. For each group g_i,
+        return the lower-triangle of g_i g_i^T (E*(E+1)/2 entries). Concat over M
+        groups. Output dim q = M * E*(E+1)/2.
+        The off-diagonals are scaled by sqrt(2) so that <psi(x), psi(y)> equals
+        sum_i <g_i, h_i>**2 -- the squared inner product per group."""
     head = x[..., :-1]
     tail = x[..., -1:]
     norm = head.norm(dim=-1, keepdim=True)
     return torch.cat([head, norm * (1.0 + tail * tail)], dim=-1)
 
 
-def spd_concat(x: torch.Tensor, num_splits: int) -> torch.Tensor:
+def spd_concat(x: torch.Tensor, k_splits: int) -> torch.Tensor:
     """Concatenated SPD one-rank feature map.
 
     Args:
@@ -51,33 +34,34 @@ def spd_concat(x: torch.Tensor, num_splits: int) -> torch.Tensor:
         num_splits: M. groups have dim E = d / M.
 
     Returns:
-        (..., M * E*(E+1)//2). For each group g of shape (E,):
-        [diag(g g^T), sqrt(2) * tril(g g^T, -1) flattened] = squared
-        coordinates concatenated with sqrt(2) * pairwise products.
-        The sqrt(2) on off-diagonals matches <psi(g), psi(h)> = <g, h>**2.
+        (..., M * E*(E+1)//2)= (..., d*(E+1)//2). For each group g of shape (E,):
     """
     *prefix, d = x.shape
-    if d % num_splits != 0:
-        raise ValueError(f"x last dim {d} not divisible by num_splits {num_splits}")
-    assert d >= 2 * num_splits
-    d_split = d // num_splits
-    g = x.view(*prefix, num_splits, d_split)
+    if d % k_splits != 0:
+        raise ValueError(
+            f"x last dim {d} not divisible by num_splits {k_splits}"
+        )
+    e = d // k_splits
+    g = x.view(*prefix, k_splits, e)
 
-    # diag = g * g  # (..., M, E)
+    diag = g * g  # (..., M, E)
+
+    if e == 1:
+        return diag.reshape(*prefix, k_splits * e)
 
     # off-diag: outer product, then take strict lower-tri, scaled by sqrt(2).
     outer = g.unsqueeze(-1) * g.unsqueeze(-2)  # (..., M, E, E)
-    ii, jj = torch.tril_indices(d_split, d_split, offset=0, device=x.device)
+    ii, jj = torch.tril_indices(e, e, offset=-1, device=x.device)
+    off = outer[..., ii, jj] * math.sqrt(2.0)  # (..., M, E*(E-1)/2)
 
-    off = outer[..., ii, jj]
-
-    return off.reshape(*prefix, num_splits * (d_split * (d_split + 1) // 2))
+    packed = torch.cat([diag, off], dim=-1)  # (..., M, E*(E+1)/2)
+    return packed.reshape(*prefix, k_splits * (e * (e + 1) // 2))
 
 
 def spd_full(x: torch.Tensor, num_splits: int) -> torch.Tensor:
     """Full outer-product SPD feature map (no sqrt(2) packing).
 
-    Output dim per group is E² (vs E·(E+1)/2 for packed). Wasteful by 2x but
+    Output dim per group is E (vs E·(E+1)/2 for packed). Wasteful by 2x but
     yields a power-of-2 output dim whenever E is a power of 2 — which our
     triton tile shapes (tl.arange) require.
 
@@ -89,7 +73,9 @@ def spd_full(x: torch.Tensor, num_splits: int) -> torch.Tensor:
         raise ValueError(f"d={d} not divisible by M={num_splits}")
     e = d // num_splits
     g = x.view(*prefix, num_splits, e)
-    out = (g.unsqueeze(-1) * g.unsqueeze(-2)).reshape(*prefix, num_splits * e * e)
+    out = (g.unsqueeze(-1) * g.unsqueeze(-2)).reshape(
+        *prefix, num_splits * e * e
+    )
     return out
 
 
@@ -187,7 +173,9 @@ def feature_map_out_dim(name: str, head_k_dim: int, num_splits: int = 1) -> int:
 class FeatureMap(nn.Module):
     """Stateless wrapper. nn.Module so it lives inside attention layer."""
 
-    def __init__(self, name: str = "positive", num_splits: int = 1, eps: float = 1e-6):
+    def __init__(
+        self, name: str = "positive", num_splits: int = 1, eps: float = 1e-6
+    ):
         super().__init__()
         if name not in (
             "positive",

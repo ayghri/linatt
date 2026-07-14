@@ -44,9 +44,7 @@ def load_model(path, device, hf_kwargs, tokenizer_name):
     saved = ckpt.get("config")
     if saved:
         hf_kwargs = {**hf_kwargs, **saved}
-        print(
-            f"[eval] architecture overridden by checkpoint-saved config ({path})"
-        )
+        print(f"[eval] architecture overridden by checkpoint-saved config ({path})")
     model = AutoModelForCausalLM.from_config(AutoConfig.for_model(**hf_kwargs))
     model.load_state_dict(ckpt["model"])
     model = model.to(device, dtype=torch.bfloat16).eval()
@@ -85,11 +83,9 @@ def main(cfg: DictConfig) -> None:
     from lm_eval.models.huggingface import HFLM
 
     for path in paths:
-        model, tok, step, tokens = load_model(
-            path, device, hf_kwargs, tokenizer
-        )
+        model, tok, step, tokens = load_model(path, device, hf_kwargs, tokenizer)
         print(
-            f"\n=== {os.path.basename(path)}  step={step}  tokens={tokens/1e9:.2f}B ==="
+            f"\n=== {os.path.basename(path)}  step={step}  tokens={tokens / 1e9:.2f}B ==="
         )
         lm = HFLM(
             pretrained=model,

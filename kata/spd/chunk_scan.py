@@ -1,4 +1,4 @@
-"""Tree-scan (parallel-prefix) chunked SPD forward -- 'flash-decoding' style.
+"""Tree-scan (parallel-prefix) chunked PSD forward.
 
 The sequential chunk kernel walks chunks left->right carrying the state S
 (O(NC) dependency depth, only B*H programs of parallelism). Here the inter-chunk
@@ -11,10 +11,7 @@ recurrence S_c = S_{c-1} + psi(K_c)^T V_c is an ASSOCIATIVE scan (addition), so:
 
 Parallelism is NC*B*H (vs B*H sequential) -- the win at low batch / long context
 (decoding). Cost: the per-chunk local states h_c live in HBM (O(NC*P*Dv)).
-sum mode, M=4 (P=E^2=256 fits SMEM), bf16 tensor cores, forward only.
 """
-
-from __future__ import annotations
 
 import torch
 import triton
@@ -23,16 +20,16 @@ import triton.language as tl
 
 @triton.jit
 def _scan_local_kernel(
-    q,
-    k,
-    v,
-    h,
-    z,
+    q_addr,
+    k_addr,
+    v_addr,
+    h_addr,
+    z_addr,
     num_i,
     den_i,
     s_scale,
     T,
-    H: tl.constexpr,
+    # H: tl.constexpr,
     D: tl.constexpr,
     E: tl.constexpr,
     M: tl.constexpr,
@@ -41,27 +38,28 @@ def _scan_local_kernel(
     C: tl.constexpr,
     NC: tl.constexpr,
 ):
-    i_c = tl.program_id(0)
-    i_bh = tl.program_id(1).to(tl.int64)
-    c0 = i_c * C
-    bos_qk = i_bh * T * D
-    bos_v = i_bh * T * DV
-    bos_h = (i_bh * NC + i_c) * P * DV
-    bos_z = (i_bh * NC + i_c) * P
+    idx_bh = tl.program_id(1)
+    idx_c = tl.program_id(0)
+    c0 = idx_c * C
+    bos_qk = idx_bh * T * D
+    bos_v = idx_bh * T * DV
+    bos_h = (idx_bh * NC + idx_c) * P * DV
+    bos_z = (idx_bh * NC + idx_c) * P
     o_row = c0 + tl.arange(0, C)
     row_ok = o_row < T
 
     b_v = tl.load(
-        tl.make_block_ptr(v + bos_v, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)),
+        tl.make_block_ptr(v_addr + bos_v, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)),
         boundary_check=(0, 1),
-    ).to(tl.bfloat16)
+    )
     psi_q = tl.zeros([C, P], dtype=tl.bfloat16)
     psi_k = tl.zeros([C, P], dtype=tl.bfloat16)
+
     for g in range(M):  # sum mode: sum over groups
         b_qg = (
             tl.load(
                 tl.make_block_ptr(
-                    q + bos_qk, (T, D), (D, 1), (c0, g * E), (C, E), (1, 0)
+                    q_addr + bos_qk, (T, D), (D, 1), (c0, g * E), (C, E), (1, 0)
                 ),
                 boundary_check=(0, 1),
             )
@@ -70,7 +68,7 @@ def _scan_local_kernel(
         b_kg = (
             tl.load(
                 tl.make_block_ptr(
-                    k + bos_qk, (T, D), (D, 1), (c0, g * E), (C, E), (1, 0)
+                    k_addr + bos_qk, (T, D), (D, 1), (c0, g * E), (C, E), (1, 0)
                 ),
                 boundary_check=(0, 1),
             )
@@ -85,12 +83,12 @@ def _scan_local_kernel(
     h_c = tl.dot(tl.trans(psi_k), b_vm)  # fp32
     z_c = tl.sum(psi_k.to(tl.float32), axis=0)
     tl.store(
-        tl.make_block_ptr(h + bos_h, (P, DV), (DV, 1), (0, 0), (P, DV), (1, 0)),
-        h_c.to(h.dtype.element_ty),
+        tl.make_block_ptr(h_addr + bos_h, (P, DV), (DV, 1), (0, 0), (P, DV), (1, 0)),
+        h_c.to(h_addr.dtype.element_ty),
     )
     tl.store(
-        tl.make_block_ptr(z + bos_z, (P,), (1,), (0,), (P,), (0,)),
-        z_c.to(z.dtype.element_ty),
+        tl.make_block_ptr(z_addr + bos_z, (P,), (1,), (0,), (P,), (0,)),
+        z_c.to(z_addr.dtype.element_ty),
     )
 
     # intra-chunk causal output
@@ -104,7 +102,7 @@ def _scan_local_kernel(
         boundary_check=(0, 1),
     )
     tl.store(
-        tl.make_block_ptr(den_i + i_bh * T, (T,), (1,), (c0,), (C,), (0,)),
+        tl.make_block_ptr(den_i + idx_bh * T, (T,), (1,), (c0,), (C,), (0,)),
         d_intra.to(den_i.dtype.element_ty),
         boundary_check=(0,),
     )
@@ -216,9 +214,19 @@ def _excl_scan_kernel(
 
 
 @triton.jit
-def _scan_blocked_A(h, Hx, bsum, NC: tl.constexpr, BC: tl.constexpr, G: tl.constexpr,
-                    P: tl.constexpr, DV: tl.constexpr, BP: tl.constexpr, BV: tl.constexpr,
-                    NV: tl.constexpr):
+def _scan_blocked_A(
+    h,
+    Hx,
+    bsum,
+    NC: tl.constexpr,
+    BC: tl.constexpr,
+    G: tl.constexpr,
+    P: tl.constexpr,
+    DV: tl.constexpr,
+    BP: tl.constexpr,
+    BV: tl.constexpr,
+    NV: tl.constexpr,
+):
     """Level-1 of the 2-level scan: block-local exclusive scan of BC chunks + block total.
     Grid (BH, G, (P/BP)*(DV/BV)) -> G*BH*tiles programs (vs BH*tiles for the flat scan),
     each of depth O(BC). Requires BC*G == NC so no boundary guard is needed."""
@@ -232,19 +240,36 @@ def _scan_blocked_A(h, Hx, bsum, NC: tl.constexpr, BC: tl.constexpr, G: tl.const
     c0 = i_blk * BC
     for j in range(BC):
         off = base + (c0 + j) * P * DV
-        op = tl.make_block_ptr(Hx + off, (P, DV), (DV, 1), (i_p * BP, i_v * BV), (BP, BV), (1, 0))
-        ip = tl.make_block_ptr(h + off, (P, DV), (DV, 1), (i_p * BP, i_v * BV), (BP, BV), (1, 0))
+        op = tl.make_block_ptr(
+            Hx + off, (P, DV), (DV, 1), (i_p * BP, i_v * BV), (BP, BV), (1, 0)
+        )
+        ip = tl.make_block_ptr(
+            h + off, (P, DV), (DV, 1), (i_p * BP, i_v * BV), (BP, BV), (1, 0)
+        )
         tl.store(op, acc)
         acc += tl.load(ip).to(tl.float32)
     ob = (i_bh * G + i_blk) * P * DV
-    tl.store(tl.make_block_ptr(bsum + ob, (P, DV), (DV, 1),
-                               (i_p * BP, i_v * BV), (BP, BV), (1, 0)), acc)
+    tl.store(
+        tl.make_block_ptr(
+            bsum + ob, (P, DV), (DV, 1), (i_p * BP, i_v * BV), (BP, BV), (1, 0)
+        ),
+        acc,
+    )
 
 
 @triton.jit
-def _scan_blocked_B(Hx, bpref, NC: tl.constexpr, BC: tl.constexpr, G: tl.constexpr,
-                    P: tl.constexpr, DV: tl.constexpr, BP: tl.constexpr, BV: tl.constexpr,
-                    NV: tl.constexpr):
+def _scan_blocked_B(
+    Hx,
+    bpref,
+    NC: tl.constexpr,
+    BC: tl.constexpr,
+    G: tl.constexpr,
+    P: tl.constexpr,
+    DV: tl.constexpr,
+    BP: tl.constexpr,
+    BV: tl.constexpr,
+    NV: tl.constexpr,
+):
     """Level-3: add each block's exclusive-over-blocks prefix onto its BC local prefixes."""
     i_bh = tl.program_id(0).to(tl.int64)
     i_blk = tl.program_id(1)
@@ -252,13 +277,18 @@ def _scan_blocked_B(Hx, bpref, NC: tl.constexpr, BC: tl.constexpr, G: tl.constex
     i_p = i_pv // NV
     i_v = i_pv % NV
     ob = (i_bh * G + i_blk) * P * DV
-    pref = tl.load(tl.make_block_ptr(bpref + ob, (P, DV), (DV, 1),
-                                     (i_p * BP, i_v * BV), (BP, BV), (1, 0)))
+    pref = tl.load(
+        tl.make_block_ptr(
+            bpref + ob, (P, DV), (DV, 1), (i_p * BP, i_v * BV), (BP, BV), (1, 0)
+        )
+    )
     base = i_bh * NC * P * DV
     c0 = i_blk * BC
     for j in range(BC):
         off = base + (c0 + j) * P * DV
-        hp = tl.make_block_ptr(Hx + off, (P, DV), (DV, 1), (i_p * BP, i_v * BV), (BP, BV), (1, 0))
+        hp = tl.make_block_ptr(
+            Hx + off, (P, DV), (DV, 1), (i_p * BP, i_v * BV), (BP, BV), (1, 0)
+        )
         tl.store(hp, tl.load(hp) + pref)
 
 
@@ -296,7 +326,6 @@ def spd_chunk_scan(q, k, v, M, mode, scale=None, C=32, eps=1e-6, warps=4):
         den_i,
         s,
         T,
-        H=H,
         D=D,
         E=E,
         M=M,
@@ -317,20 +346,37 @@ def spd_chunk_scan(q, k, v, M, mode, scale=None, C=32, eps=1e-6, warps=4):
     Hx = torch.empty_like(h)
     BPs, BVs = min(64, P), min(64, DV)
     pgrid = (triton.cdiv(P, BPs), triton.cdiv(DV, BVs))
-    if NC <= 256 or (NC & (NC - 1)) != 0:            # few chunks, or non-power-of-2 NC
-        _excl_scan_kernel[(B * H, *pgrid)](h, Hx, NC=NC, P=P, DV=DV, BP=BPs, BV=BVs, num_warps=4)
+    if NC <= 256 or (NC & (NC - 1)) != 0:  # few chunks, or non-power-of-2 NC
+        _excl_scan_kernel[(B * H, *pgrid)](
+            h, Hx, NC=NC, P=P, DV=DV, BP=BPs, BV=BVs, num_warps=4
+        )
     else:
-        BC = 1 << ((NC.bit_length() - 1) // 2)       # ~sqrt(NC), divides NC (power of 2)
+        BC = 1 << ((NC.bit_length() - 1) // 2)  # ~sqrt(NC), divides NC (power of 2)
         G = NC // BC
-        NV = pgrid[1]                                 # number of DV tiles
-        NPV = pgrid[0] * pgrid[1]                     # flattened (P,DV) tiles -> axis 2
+        NV = pgrid[1]  # number of DV tiles
+        NPV = pgrid[0] * pgrid[1]  # flattened (P,DV) tiles -> axis 2
         bsum = torch.empty(B, H, G, P, DV, device=q.device, dtype=torch.float32)
-        _scan_blocked_A[(B * H, G, NPV)](h, Hx, bsum, NC=NC, BC=BC, G=G,
-                                         P=P, DV=DV, BP=BPs, BV=BVs, NV=NV, num_warps=4)
+        _scan_blocked_A[(B * H, G, NPV)](
+            h,
+            Hx,
+            bsum,
+            NC=NC,
+            BC=BC,
+            G=G,
+            P=P,
+            DV=DV,
+            BP=BPs,
+            BV=BVs,
+            NV=NV,
+            num_warps=4,
+        )
         bpref = torch.empty_like(bsum)
-        _excl_scan_kernel[(B * H, *pgrid)](bsum, bpref, NC=G, P=P, DV=DV, BP=BPs, BV=BVs, num_warps=4)
-        _scan_blocked_B[(B * H, G, NPV)](Hx, bpref, NC=NC, BC=BC, G=G,
-                                         P=P, DV=DV, BP=BPs, BV=BVs, NV=NV, num_warps=4)
+        _excl_scan_kernel[(B * H, *pgrid)](
+            bsum, bpref, NC=G, P=P, DV=DV, BP=BPs, BV=BVs, num_warps=4
+        )
+        _scan_blocked_B[(B * H, G, NPV)](
+            Hx, bpref, NC=NC, BC=BC, G=G, P=P, DV=DV, BP=BPs, BV=BVs, NV=NV, num_warps=4
+        )
     Zx = zc.cumsum(2) - zc
 
     o = torch.empty(B, H, T, DV, device=q.device, dtype=q.dtype)

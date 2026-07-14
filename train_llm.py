@@ -128,10 +128,17 @@ def build_lr_param_groups(model, weight_decay, lr_mult):
     MLP/embeddings stay at base.
     """
     import re
+
     params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     if not lr_mult:
-        return [{"params": [p for _, p in params], "lr_mult": 1.0,
-                 "weight_decay": weight_decay, "name": "all"}]
+        return [
+            {
+                "params": [p for _, p in params],
+                "lr_mult": 1.0,
+                "weight_decay": weight_decay,
+                "name": "all",
+            }
+        ]
     rules = list(lr_mult.items() if isinstance(lr_mult, dict) else lr_mult)
     # one named group per pattern (+ a "base" group for unmatched); first match wins.
     buckets = {"base": (1.0, [])}
@@ -140,11 +147,18 @@ def build_lr_param_groups(model, weight_decay, lr_mult):
     for name, p in params:
         key = next((pat for pat, m in rules if re.search(pat, name)), "base")
         buckets[key][1].append(p)
-    groups = [{"params": ps, "lr_mult": mult, "weight_decay": weight_decay, "name": key}
-              for key, (mult, ps) in buckets.items() if ps]
-    print("[lr_mult] groups: " + ", ".join(
-        f"{g['name']}(x{g['lr_mult']:g}): {sum(p.numel() for p in g['params'])/1e6:.1f}M"
-        for g in groups))
+    groups = [
+        {"params": ps, "lr_mult": mult, "weight_decay": weight_decay, "name": key}
+        for key, (mult, ps) in buckets.items()
+        if ps
+    ]
+    print(
+        "[lr_mult] groups: "
+        + ", ".join(
+            f"{g['name']}(x{g['lr_mult']:g}): {sum(p.numel() for p in g['params']) / 1e6:.1f}M"
+            for g in groups
+        )
+    )
     return groups
 
 
@@ -173,12 +187,11 @@ class WarmedUpScheduler:
     def update(self, t):
         lr = self.get_lr(t)
         for g in self.optimizer.param_groups:
-            g["lr"] = lr * g.get("lr_mult", 1.0)   # per-group LR multiplier
+            g["lr"] = lr * g.get("lr_mult", 1.0)  # per-group LR multiplier
         return lr
 
 
 class DDPLLMPretrainer:
-
     def __init__(self, model, dataset, cfg):
         self.cfg = cfg
         tr, data = cfg.train, cfg.data
@@ -193,9 +206,9 @@ class DDPLLMPretrainer:
         self.batch_size = (
             self.tokens_per_step // self.world_size // self.grad_accum // self.seq_len
         )
-        assert (
-            self.batch_size > 0
-        ), "tokens_per_step too small for world*grad_accum*seq_len"
+        assert self.batch_size > 0, (
+            "tokens_per_step too small for world*grad_accum*seq_len"
+        )
 
         self.max_steps = int(data.target_tokens) // self.tokens_per_step
         self.warmup_steps = int(tr.warmup_tokens) // self.tokens_per_step
@@ -332,11 +345,14 @@ class DDPLLMPretrainer:
         # Prune old step checkpoints to bound disk usage (keep the newest K).
         try:
             steps = sorted(
-                (p for p in os.listdir(self.save_dir)
-                 if p.startswith("step_") and p.endswith(".pt")),
+                (
+                    p
+                    for p in os.listdir(self.save_dir)
+                    if p.startswith("step_") and p.endswith(".pt")
+                ),
                 key=lambda p: int(p[5:-3]),
             )
-            for old in steps[:-self.keep_last_k]:
+            for old in steps[: -self.keep_last_k]:
                 os.remove(os.path.join(self.save_dir, old))
         except (OSError, ValueError):
             pass
@@ -354,7 +370,7 @@ class DDPLLMPretrainer:
         if self.is_main():
             print(
                 f"resumed from {path} at step {self.start_step} "
-                f"({ckpt.get('tokens_seen', 0)/1e9:.2f}B tokens)"
+                f"({ckpt.get('tokens_seen', 0) / 1e9:.2f}B tokens)"
             )
 
     def _next_input_ids(self):
@@ -453,7 +469,7 @@ class DDPLLMPretrainer:
                 pbar.set_postfix(
                     {
                         "loss": f"{step_loss.item():.4f}",
-                        "tok/s": f"{tok_per_sec/1e3:.0f}k",
+                        "tok/s": f"{tok_per_sec / 1e3:.0f}k",
                     }
                 )
 

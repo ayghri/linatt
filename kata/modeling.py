@@ -18,14 +18,13 @@ from fla.models.linear_attn.modeling_linear_attn import (
     LinearAttentionForCausalLM,
     LinearAttentionModel,
     LinearAttentionPreTrainedModel,
-    LinearAttentionBlock,
 )
 from fla.models.modeling_layers import GradientCheckpointingLayer
 from fla.modules import RMSNorm
 from fla.modules import GatedMLP
 
 from kata.configuration import KataConfig
-from kata.layer import KataAttention
+from kata.layer import build_kata_mixer
 
 if TYPE_CHECKING:
     pass
@@ -55,38 +54,8 @@ class KataBlock(GradientCheckpointingLayer):
                 layer_idx=layer_idx,
             )
         else:
-            self.attn = KataAttention(
-                mode=config.attn_mode,
-                hidden_size=config.hidden_size,
-                expand_k=config.expand_k,
-                expand_v=config.expand_v,
-                num_heads=config.num_heads,
-                num_kv_heads=config.num_kv_heads,
-                feature_map=config.feature_map,
-                spd_num_groups=config.spd_num_groups,
-                spd_use_kernel=config.spd_use_kernel,
-                spd_chunk_size=config.spd_chunk_size,
-                use_delta=config.use_delta,
-                delta_scale=config.delta_scale,
-                delta_normalize=config.delta_normalize,
-                delta_state=config.delta_state,
-                use_offset_gate=config.use_offset_gate,
-                use_decay=config.use_decay,
-                feature_map_eps=config.feature_map_eps,
-                qk_norm=config.qk_norm,
-                norm_q=config.norm_q,
-                norm_k=config.norm_k,
-                use_short_conv=config.use_short_conv,
-                conv_size=config.conv_size,
-                conv_bias=config.conv_bias,
-                use_rope=config.use_rope,
-                rope_theta=config.rope_theta,
-                rope_group=config.rope_group,
-                max_position_embeddings=config.max_position_embeddings,
-                elementwise_affine=config.elementwise_affine,
-                norm_eps=config.norm_eps,
-                layer_idx=layer_idx,
-            )
+            # dispatch to FlashKata / ChunkedKata / DeltaKata by config (see kata/layer.py)
+            self.attn = build_kata_mixer(config, layer_idx)
 
         self.mlp_norm = norm_cls(config.hidden_size, eps=config.norm_eps)
         self.mlp = GatedMLP(
