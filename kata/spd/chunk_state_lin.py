@@ -12,7 +12,6 @@ A reads S before C writes it -> independent; B is state-free. State S is (B*H, E
 psi(x) = sum_g x_g (x) x_g  (symmetric E x E); grams/state sum over all group pairs (g,h).
 """
 
-from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
@@ -32,7 +31,6 @@ def _state_lin_kernel(
     state_addr,
     state_scale_addr,
     T,
-    H: tl.constexpr,
     D: tl.constexpr,
     E: tl.constexpr,
     M: tl.constexpr,
@@ -56,7 +54,7 @@ def _state_lin_kernel(
         m_row = (c0 + o_row)[:, None] < T
         b_v = tl.load(v_addr + bv + rowd, mask=m_row, other=0.0).to(tl.bfloat16)
 
-        # ---- Chain B (intra): A_qk = sum_{g,h} (scale q_g . k_h)^2 ; oI = tril(A_qk) @ V ----
+        # Chain B (intra): A_qk = sum_{g,h} (scale q_g . k_h)^2 ; oI = tril(A_qk) @ V
         Aqk = tl.zeros([C, C], dtype=tl.float32)
         for g in range(M):
             qg = (
@@ -83,8 +81,8 @@ def _state_lin_kernel(
         Aqk = tl.where(causal, Aqk, 0.0)
         oI = tl.dot(Aqk.to(tl.bfloat16), b_v)  # intra output, no state
 
-        # ---- Chain A (cross): oQS = psi(Q_c) . S_{c-1}  (feature-blocked over i) ----
-        # ---- Chain C (update): S += psi(K_c)^T . V_c    (same feature blocks) ----
+        # Chain A (cross): oQS = psi(Q_c) . S_{c-1}  (feature-blocked over i)
+        # Chain C (update): S += psi(K_c)^T . V_c    (same feature blocks)
         oQS = tl.zeros([C, DV], dtype=tl.float32)
         for i0 in range(0, E, BI):
             pQ = tl.zeros([C, BI * E], dtype=tl.float32)
@@ -102,7 +100,12 @@ def _state_lin_kernel(
                 qsl = (
                     tl.load(
                         tl.make_block_ptr(
-                            q_addr + bqk, (T, D), (D, 1), (c0, g * E + i0), (C, BI), (1, 0)
+                            q_addr + bqk,
+                            (T, D),
+                            (D, 1),
+                            (c0, g * E + i0),
+                            (C, BI),
+                            (1, 0),
                         ),
                         boundary_check=(0, 1),
                     )
@@ -120,7 +123,12 @@ def _state_lin_kernel(
                 ksl = (
                     tl.load(
                         tl.make_block_ptr(
-                            k_addr + bqk, (T, D), (D, 1), (c0, g * E + i0), (C, BI), (1, 0)
+                            k_addr + bqk,
+                            (T, D),
+                            (D, 1),
+                            (c0, g * E + i0),
+                            (C, BI),
+                            (1, 0),
                         ),
                         boundary_check=(0, 1),
                     )
@@ -135,7 +143,9 @@ def _state_lin_kernel(
             # bf16 matmul inputs, fp32 accumulate; S_blk+upd both fp32 -> state stays fp32-accumulated
             oQS += tl.dot(pQ.to(tl.bfloat16), S_blk.to(tl.bfloat16))  # chain A
             upd = tl.dot(tl.trans(pK.to(tl.bfloat16)), b_v)  # chain C (fp32 accum)
-            tl.store(pS, (S_blk + upd).to(state_addr.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(
+                pS, (S_blk + upd).to(state_addr.dtype.element_ty), boundary_check=(0, 1)
+            )
 
         tl.store(o_addr + bv + rowd, (oQS + oI).to(o_addr.dtype.element_ty), mask=m_row)
 
@@ -164,7 +174,6 @@ def _lin_bwd_p1_kernel(
     Hst,
     s_scale,
     T,
-    H: tl.constexpr,
     D: tl.constexpr,
     E: tl.constexpr,
     M: tl.constexpr,
@@ -306,7 +315,6 @@ def _lin_bwd_p2_kernel(
     Rst,
     s_scale,
     T,
-    H: tl.constexpr,
     D: tl.constexpr,
     E: tl.constexpr,
     M: tl.constexpr,
@@ -433,7 +441,7 @@ class _StateLin(torch.autograd.Function):
         o = torch.empty(B, H, T, DV, device=q.device, dtype=torch.float32)
         S = torch.zeros(B * H, E2, DV, device=q.device, dtype=torch.float32)
         _state_lin_kernel[(B * H,)](
-            q, k, v, o, S, scale**0.5, T, H=H, D=D, E=E, M=M, DV=DV, C=C, E2=E2, BI=BI
+            q, k, v, o, S, scale**0.5, T, D=D, E=E, M=M, DV=DV, C=C, E2=E2, BI=BI
         )
         ctx.save_for_backward(q, k, v)
         ctx.M, ctx.scale, ctx.C, ctx.BI, ctx.E, ctx.E2 = M, scale, C, BI, E, E2

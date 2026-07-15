@@ -19,11 +19,7 @@ import triton
 import triton.language as tl
 
 # num_stages=2 software-pipelines the S-load <-> MMA (measured ~8% on M=1); num_warps=8 usually wins.
-_CFG = [
-    triton.Config({}, num_warps=w, num_stages=s)
-    for w in (4, 8)
-    for s in (1, 2)
-]
+_CFG = [triton.Config({}, num_warps=w, num_stages=s) for w in (4, 8) for s in (1, 2)]
 
 
 @triton.autotune(
@@ -33,16 +29,15 @@ _CFG = [
 )
 @triton.jit
 def _state_v2_kernel(
-    q,
-    k,
-    v,
+    q_addr,
+    k_addr,
+    v_addr,
     beta,
     o,
     Uout,
     S,
     s_scale,
     T,
-    H: tl.constexpr,
     D: tl.constexpr,
     E: tl.constexpr,
     M: tl.constexpr,
@@ -53,14 +48,14 @@ def _state_v2_kernel(
     BI: tl.constexpr,
     WRITE_U: tl.constexpr,
 ):
-    i_bh = tl.program_id(0).to(tl.int64)
+    i_bh = tl.program_id(0)
     bqk = i_bh * T * D
     bv = i_bh * T * DV
     bs = i_bh * E2 * DV
     NC = tl.cdiv(T, C)
     o_row = tl.arange(0, C)
     rdv = tl.arange(0, DVB)
-    rbe = tl.arange(0, BI * E)  # features within one i-block
+    # rbe = tl.arange(0, BI * E)  # features within one i-block
     eye = (o_row[:, None] == o_row[None, :]).to(tl.float32)
     strict = (o_row[:, None] > o_row[None, :]).to(tl.float32)
     blk = o_row // 16
@@ -77,7 +72,7 @@ def _state_v2_kernel(
             kg = (
                 tl.load(
                     tl.make_block_ptr(
-                        k + bqk, (T, D), (D, 1), (c0, g * E), (C, E), (1, 0)
+                        k_addr + bqk, (T, D), (D, 1), (c0, g * E), (C, E), (1, 0)
                     ),
                     boundary_check=(0, 1),
                 )
@@ -86,7 +81,7 @@ def _state_v2_kernel(
             qg = (
                 tl.load(
                     tl.make_block_ptr(
-                        q + bqk, (T, D), (D, 1), (c0, g * E), (C, E), (1, 0)
+                        q_addr + bqk, (T, D), (D, 1), (c0, g * E), (C, E), (1, 0)
                     ),
                     boundary_check=(0, 1),
                 )
@@ -96,7 +91,7 @@ def _state_v2_kernel(
                 khh = (
                     tl.load(
                         tl.make_block_ptr(
-                            k + bqk,
+                            k_addr + bqk,
                             (T, D),
                             (D, 1),
                             (c0, hh * E),
@@ -114,9 +109,8 @@ def _state_v2_kernel(
         Aqk = tl.where(o_row[:, None] >= o_row[None, :], Aqk, 0.0)  # tril
         # --- block-inverse T = (I + beta*tril(A_kk,-1))^-1  (FLA-style, C=64) ---
         N = b_beta[:, None] * (Akk * strict)
-        N_bd = tl.where(
-            blk[:, None] == blk[None, :], N, 0.0
-        )  # 16x16 diagonal blocks
+        # 16x16 diagonal blocks
+        N_bd = tl.where(blk[:, None] == blk[None, :], N, 0.0)
         Tm = eye
         for i in range(1, 16):  # forward-sub within 16-blocks
             corr = tl.dot(
@@ -147,9 +141,9 @@ def _state_v2_kernel(
         # --- DV-tiles (inside the program; A_kk/A_qk/T shared) ---
         for dv0 in range(0, DV, DVB):
             rowd = (c0 + o_row)[:, None] * DV + (dv0 + rdv)[None, :]
-            b_v = tl.load(
-                v + bv + rowd, mask=(c0 + o_row)[:, None] < T, other=0.0
-            ).to(tl.float32)
+            b_v = tl.load(v_addr + bv + rowd, mask=(c0 + o_row)[:, None] < T, other=0.0).to(
+                tl.float32
+            )
             # Ec = psi(K) @ S  (feature-blocked)
             Ec = tl.zeros([C, DVB], dtype=tl.float32)
             for i0 in range(0, E, BI):
@@ -158,7 +152,7 @@ def _state_v2_kernel(
                     kg = (
                         tl.load(
                             tl.make_block_ptr(
-                                k + bqk,
+                                k_addr + bqk,
                                 (T, D),
                                 (D, 1),
                                 (c0, g * E),
@@ -172,7 +166,7 @@ def _state_v2_kernel(
                     ksl = (
                         tl.load(
                             tl.make_block_ptr(
-                                k + bqk,
+                                k_addr + bqk,
                                 (T, D),
                                 (D, 1),
                                 (c0, g * E + i0),
@@ -183,9 +177,7 @@ def _state_v2_kernel(
                         )
                         * s_scale
                     )
-                    pK += tl.reshape(
-                        ksl[:, :, None] * kg[:, None, :], (C, BI * E)
-                    )
+                    pK += tl.reshape(ksl[:, :, None] * kg[:, None, :], (C, BI * E))
                 S_blk = tl.load(
                     tl.make_block_ptr(
                         S + bs,
@@ -214,7 +206,7 @@ def _state_v2_kernel(
                     qg = (
                         tl.load(
                             tl.make_block_ptr(
-                                q + bqk,
+                                q_addr + bqk,
                                 (T, D),
                                 (D, 1),
                                 (c0, g * E),
@@ -228,7 +220,7 @@ def _state_v2_kernel(
                     qsl = (
                         tl.load(
                             tl.make_block_ptr(
-                                q + bqk,
+                                q_addr + bqk,
                                 (T, D),
                                 (D, 1),
                                 (c0, g * E + i0),
@@ -239,9 +231,7 @@ def _state_v2_kernel(
                         )
                         * s_scale
                     )
-                    pQ += tl.reshape(
-                        qsl[:, :, None] * qg[:, None, :], (C, BI * E)
-                    )
+                    pQ += tl.reshape(qsl[:, :, None] * qg[:, None, :], (C, BI * E))
                 S_blk = tl.load(
                     tl.make_block_ptr(
                         S + bs,
@@ -267,7 +257,7 @@ def _state_v2_kernel(
                     kg = (
                         tl.load(
                             tl.make_block_ptr(
-                                k + bqk,
+                                k_addr + bqk,
                                 (T, D),
                                 (D, 1),
                                 (c0, g * E),
@@ -281,7 +271,7 @@ def _state_v2_kernel(
                     ksl = (
                         tl.load(
                             tl.make_block_ptr(
-                                k + bqk,
+                                k_addr + bqk,
                                 (T, D),
                                 (D, 1),
                                 (c0, g * E + i0),
@@ -292,9 +282,7 @@ def _state_v2_kernel(
                         )
                         * s_scale
                     )
-                    pK += tl.reshape(
-                        ksl[:, :, None] * kg[:, None, :], (C, BI * E)
-                    )
+                    pK += tl.reshape(ksl[:, :, None] * kg[:, None, :], (C, BI * E))
                 upd = tl.dot(
                     tl.trans(pK.to(tl.bfloat16)), U.to(tl.bfloat16)
                 )  # (BI*E, DVB)
@@ -308,9 +296,7 @@ def _state_v2_kernel(
                 )
                 tl.store(
                     pS,
-                    (tl.load(pS, boundary_check=(0, 1)) + upd).to(
-                        S.dtype.element_ty
-                    ),
+                    (tl.load(pS, boundary_check=(0, 1)) + upd).to(S.dtype.element_ty),
                     boundary_check=(0, 1),
                 )
 
@@ -324,9 +310,7 @@ def spd_delta_state_v2(
     E2 = E * E
     if scale is None:
         scale = 1.0 / E
-    if (
-        DVB is None
-    ):  # full DV = single tile: N=DV matmuls + psi materialized once
+    if DVB is None:  # full DV = single tile: N=DV matmuls + psi materialized once
         DVB = DV
     DVB = min(DVB, DV)
     while DV % DVB != 0:
@@ -374,9 +358,7 @@ class _StateDelta(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, beta, M, scale, C):
-        o, U, S = spd_delta_state_v2(
-            q, k, v, beta, M, scale=scale, C=C, return_us=True
-        )
+        o, U, S = spd_delta_state_v2(q, k, v, beta, M, scale=scale, C=C, return_us=True)
         ctx.save_for_backward(
             q, k, v, beta, U, S
         )  # S = final state, backward clones it
@@ -456,21 +438,15 @@ def _state_bwd_kernel(
             boundary_check=(0,),
         ).to(tl.float32)
         b_do = tl.load(
-            tl.make_block_ptr(
-                do + bv, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)
-            ),
+            tl.make_block_ptr(do + bv, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)),
             boundary_check=(0, 1),
         ).to(tl.float32)
         b_v = tl.load(
-            tl.make_block_ptr(
-                v + bv, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)
-            ),
+            tl.make_block_ptr(v + bv, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)),
             boundary_check=(0, 1),
         ).to(tl.float32)
         b_U = tl.load(
-            tl.make_block_ptr(
-                U + bv, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)
-            ),
+            tl.make_block_ptr(U + bv, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)),
             boundary_check=(0, 1),
         ).to(tl.float32)
         # (1) reverse-recompute S_c = S - psi(K)^T U
@@ -632,9 +608,7 @@ def _state_bwd_kernel(
             Ec += tl.dot(pK.to(tl.bfloat16), S_blk.to(tl.bfloat16))
             dU += tl.dot(pK.to(tl.bfloat16), dS_blk.to(tl.bfloat16))
         Vp = b_v - Ec
-        dU += tl.dot(
-            tl.trans(Lqk).to(tl.bfloat16), b_do.to(tl.bfloat16)
-        )  # + Lqk^T do
+        dU += tl.dot(tl.trans(Lqk).to(tl.bfloat16), b_do.to(tl.bfloat16))  # + Lqk^T do
         # (4) dbVp = Tm^-T dU ; dTm = -dbVp U^T
         dbVp = tl.dot(tl.trans(Tm).to(tl.bfloat16), dU.to(tl.bfloat16))
         dTm = -tl.dot(dbVp.to(tl.bfloat16), tl.trans(b_U).to(tl.bfloat16))
@@ -770,23 +744,19 @@ def _state_bwd_kernel(
                     boundary_check=(0, 1),
                 )
             # dS_c += psi(Q)^T do + psi(K)^T dE
-            upd = tl.dot(
-                tl.trans(pQ.to(tl.bfloat16)), b_do.to(tl.bfloat16)
-            ) + tl.dot(tl.trans(pK.to(tl.bfloat16)), dE.to(tl.bfloat16))
+            upd = tl.dot(tl.trans(pQ.to(tl.bfloat16)), b_do.to(tl.bfloat16)) + tl.dot(
+                tl.trans(pK.to(tl.bfloat16)), dE.to(tl.bfloat16)
+            )
             pdS = tl.make_block_ptr(
                 dS + bs, (E2, DV), (DV, 1), (i0 * E, 0), (BI * E, DV), (1, 0)
             )
             tl.store(
                 pdS,
-                (tl.load(pdS, boundary_check=(0, 1)) + upd).to(
-                    dS.dtype.element_ty
-                ),
+                (tl.load(pdS, boundary_check=(0, 1)) + upd).to(dS.dtype.element_ty),
                 boundary_check=(0, 1),
             )
         tl.store(
-            tl.make_block_ptr(
-                dv + bv, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)
-            ),
+            tl.make_block_ptr(dv + bv, (T, DV), (DV, 1), (c0, 0), (C, DV), (1, 0)),
             dVp.to(dv.dtype.element_ty),
             boundary_check=(0, 1),
         )
@@ -797,18 +767,14 @@ def _state_bwd_kernel(
         )
 
 
-def spd_delta_state_bwd(
-    q, k, v, beta, do, U, S_final, M, scale=None, C=64, BI=None
-):
+def spd_delta_state_bwd(q, k, v, beta, do, U, S_final, M, scale=None, C=64, BI=None):
     B, H, T, D = q.shape
     DV = v.shape[-1]
     E = D // M
     E2 = E * E
     if scale is None:
         scale = 1.0 / E
-    if (
-        BI is None
-    ):  # backward holds ~6 big tiles; E=64 (M=1) needs BI=1 to fit SRAM
+    if BI is None:  # backward holds ~6 big tiles; E=64 (M=1) needs BI=1 to fit SRAM
         BI = 1 if E >= 64 else max(1, 128 // E)
     while E % BI != 0:
         BI //= 2
